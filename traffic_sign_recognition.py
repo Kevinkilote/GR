@@ -1,19 +1,20 @@
+import argparse
+from typing import Dict, Optional, Set, Tuple
+
 import cv2
 import torch
 import torchvision
-import numpy as np
-import argparse
+from PIL import Image
 from ultralytics import YOLO
 import torchvision.transforms as transforms
-from PIL import Image
 
 # --- SCRIPT CONTROLS ---
 #  - Press 'spacebar' to pause/resume the video.
 #  - Press 'q' to quit the video player.
 
 # --- CONFIGURATION ---
-# Updated list of 20 class names as provided by the user.
-CLASS_NAMES = [
+# These class names must match the ResNet training order exactly.
+RESNET_CLASS_NAMES = [
     'information--parking--g1',
     'information--pedestrians-crossing--g1',
     'information--tram-bus-stop--g2',
@@ -35,131 +36,235 @@ CLASS_NAMES = [
     'warning--slippery-road-surface--g1'
 ]
 
-def main(video_path, yolo_model_path, resnet_model_path, display_size):
-    """
-    Main function to process a video file for traffic sign detection and recognition.
-    """
-    # --- MODEL AND DEVICE SETUP ---
+# Lower-case names of YOLO classes that should be refined by the ResNet recognizer.
+# Update this list if your YOLO checkpoint exposes additional traffic-sign labels.
+DEFAULT_SIGN_LABELS = {
+    'traffic sign',
+}
+
+# Colors for bounding boxes (BGR).
+BOX_COLORS = {
+    'traffic sign': (0, 255, 0),     # green
+    'traffic light': (0, 255, 255),  # yellow
+    'car': (255, 0, 0),              # blue
+    'default': (255, 255, 255),      # white
+}
+
+
+def parse_display_size(arg: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Parse WIDTHxHEIGHT strings provided on the CLI."""
+    if not arg:
+        return None
     try:
-        # Set the device to a GPU (CUDA) if available, otherwise use the CPU.
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"INFO: Using device: {device}")
+        width, height = map(int, arg.lower().split('x'))
+        return width, height
+    except ValueError:
+        raise ValueError("--display-size must use WIDTHxHEIGHT format, e.g., 1280x720")
 
-        # 1. Load your pre-trained YOLO model for traffic sign detection.
-        print(f"INFO: Loading YOLO detector from '{yolo_model_path}'...")
-        yolo_model = YOLO(yolo_model_path).to(device)
-        print("INFO: YOLO model loaded successfully.")
 
-        # 2. Define the ResNet-18 architecture and load your trained weights.
-        print(f"INFO: Loading ResNet recognizer from '{resnet_model_path}'...")
-        resnet_model = torchvision.models.resnet18(weights=None)
-        num_ftrs = resnet_model.fc.in_features
-        resnet_model.fc = torch.nn.Linear(num_ftrs, len(CLASS_NAMES))
-        resnet_model.load_state_dict(torch.load(resnet_model_path, map_location=device))
-        resnet_model = resnet_model.to(device)
-        resnet_model.eval()
-        print("INFO: ResNet model loaded successfully.")
+def parse_sign_labels(raw_labels: Optional[str]) -> Optional[Set[str]]:
+    """Convert a comma-separated label string into a normalized set."""
+    if not raw_labels:
+        return None
+    labels = {label.strip().lower() for label in raw_labels.split(',') if label.strip()}
+    return labels or None
 
-    except Exception as e:
-        print(f"ERROR: Could not load models. {e}")
-        print("Please check that model paths are correct and all necessary libraries are installed.")
+
+def load_models(yolo_path: str, resnet_path: str, device: torch.device):
+    """Load YOLO and ResNet models and return them with YOLO label mapping."""
+    print(f"INFO: Loading YOLO detector from '{yolo_path}'...")
+    yolo_model = YOLO(yolo_path).to(device)
+
+    names_attr = yolo_model.names
+    if isinstance(names_attr, dict):
+        yolo_class_names: Dict[int, str] = names_attr
+    else:
+        yolo_class_names = {idx: name for idx, name in enumerate(names_attr)}
+    print("INFO: YOLO model loaded successfully.")
+
+    print(f"INFO: Loading ResNet recognizer from '{resnet_path}'...")
+    resnet_model = torchvision.models.resnet18(weights=None)
+    num_ftrs = resnet_model.fc.in_features
+    resnet_model.fc = torch.nn.Linear(num_ftrs, len(RESNET_CLASS_NAMES))
+    resnet_model.load_state_dict(torch.load(resnet_path, map_location=device))
+    resnet_model = resnet_model.to(device)
+    resnet_model.eval()
+    print("INFO: ResNet model loaded successfully.")
+
+    return yolo_model, yolo_class_names, resnet_model
+
+
+def classify_sign(
+    frame,
+    bbox,
+    resnet_model,
+    resnet_transform,
+    device,
+) -> Optional[Tuple[str, float]]:
+    """Crop a detection, run it through ResNet, and return name/confidence."""
+    x1, y1, x2, y2 = bbox
+    cropped = frame[y1:y2, x1:x2]
+    if cropped.size == 0:
+        return None
+
+    cropped_pil = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+    input_tensor = resnet_transform(cropped_pil).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = resnet_model(input_tensor)
+        probabilities = torch.nn.functional.softmax(output, dim=1)
+        confidence = torch.max(probabilities).item()
+        predicted_idx = torch.argmax(probabilities).item()
+        sign_name = RESNET_CLASS_NAMES[predicted_idx]
+
+    return sign_name, confidence
+
+
+def main(
+    video_path: str,
+    yolo_model_path: str,
+    resnet_model_path: str,
+    display_size: Optional[Tuple[int, int]],
+    sign_label_overrides: Optional[Set[str]],
+    conf_threshold: float,
+) -> None:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"INFO: Using device: {device}")
+
+    try:
+        yolo_model, yolo_class_names, resnet_model = load_models(
+            yolo_model_path, resnet_model_path, device
+        )
+    except Exception as exc:
+        print(f"ERROR: Could not load models. {exc}")
         return
 
-    # 3. Define the image transformations required for the ResNet model.
+    sign_labels = sign_label_overrides or DEFAULT_SIGN_LABELS
+    print("INFO: YOLO classes that will be refined by ResNet:")
+    for name in sorted(sign_labels):
+        print(f"      - {name}")
+
     resnet_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # --- VIDEO PROCESSING ---
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"ERROR: Could not open video file at '{video_path}'")
         return
 
     paused = False
+    frame = None
+
     print("\nINFO: Starting video processing...")
     print("      Press 'spacebar' to pause/play.")
     print("      Press 'q' to quit.")
 
     while cap.isOpened():
-        # Only read a new frame if the video is not paused.
         if not paused:
             ret, frame = cap.read()
             if not ret:
                 print("INFO: End of video reached.")
                 break
 
-            # --- AI INFERENCE PIPELINE ---
-            detections = yolo_model(frame, verbose=False)[0]
+            results = yolo_model(frame, conf=conf_threshold, verbose=False)[0]
 
-            for detection in detections.boxes.data.tolist():
-                x1, y1, x2, y2, score, class_id = detection
-                
-                if score > 0.65:
-                    cropped_sign_np = frame[int(y1):int(y2), int(x1):int(x2)]
-                    cropped_sign_pil = Image.fromarray(cv2.cvtColor(cropped_sign_np, cv2.COLOR_BGR2RGB))
-                    input_tensor = resnet_transform(cropped_sign_pil).unsqueeze(0).to(device)
+            for box in results.boxes:
+                score = float(box.conf.item())
+                class_id = int(box.cls.item())
+                class_name = yolo_class_names.get(class_id, f"class_{class_id}")
+                class_name_lower = class_name.lower()
 
-                    with torch.no_grad():
-                        output = resnet_model(input_tensor)
-                        probabilities = torch.nn.functional.softmax(output, dim=1)
-                        confidence = torch.max(probabilities).item()
-                        predicted_idx = torch.argmax(probabilities).item()
-                        sign_name = CLASS_NAMES[predicted_idx]
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame.shape[1] - 1, x2)
+                y2 = min(frame.shape[0] - 1, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
 
-                    # --- VISUALIZATION ---
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                    label = f"{sign_name}: {confidence:.2f}"
-                    cv2.putText(frame, label, (int(x1), int(y1) - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                label = f"{class_name}: {score:.2f}"
+                color = BOX_COLORS.get(class_name_lower, BOX_COLORS['default'])
 
-        # --- DISPLAY FRAME AND HANDLE USER INPUT ---
-        # MODIFICATION: Resize the frame for display if a size is specified.
+                if class_name_lower in sign_labels and score >= conf_threshold:
+                    classified = classify_sign(
+                        frame, (x1, y1, x2, y2), resnet_model, resnet_transform, device
+                    )
+                    if classified is not None:
+                        sign_name, confidence = classified
+                        label = f"{sign_name}: {confidence:.2f}"
+                        color = BOX_COLORS['traffic sign']
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, max(y1 - 10, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    color,
+                    2,
+                )
+
+        if frame is None:
+            break
+
+        frame_to_display = frame
         if display_size:
-            display_frame = cv2.resize(frame, display_size)
-        else:
-            display_frame = frame
-            
-        cv2.imshow('Traffic Sign Recognition Demo', display_frame)
+            frame_to_display = cv2.resize(frame_to_display, display_size)
 
-        key = cv2.waitKey(1) & 0xFF
+        cv2.imshow('Traffic Sign Recognition Demo', frame_to_display)
 
+        key = cv2.waitKey(1 if not paused else 0) & 0xFF
         if key == ord('q'):
             break
-        
         if key == ord(' '):
             paused = not paused
-            if paused:
-                print("INFO: Paused. Press spacebar to resume.")
-            else:
-                print("INFO: Resumed.")
+            print("INFO: Paused. Press spacebar to resume." if paused else "INFO: Resumed.")
 
-    # --- CLEANUP ---
     cap.release()
     cv2.destroyAllWindows()
     print("INFO: Demo finished.")
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Process a video to detect and recognize traffic signs for a demo.")
+    parser = argparse.ArgumentParser(
+        description="Detect cars, traffic lights, and traffic signs with YOLO, refine signs with ResNet."
+    )
     parser.add_argument('--video', type=str, required=True, help="Path to the input MP4 video file.")
-    # MODIFICATION: Updated default paths for models.
     parser.add_argument('--yolo', type=str, default='runs/detect/train3/weights/best.pt', help="Path to the YOLO .pt model file.")
     parser.add_argument('--resnet', type=str, default='best_traffic_sign_classifier_advanced.pth', help="Path to the ResNet .pth model file.")
-    # MODIFICATION: Added optional argument for display size.
     parser.add_argument('--display-size', type=str, default=None, help="Optional display window size, e.g., '1280x720'.")
-    
+    parser.add_argument(
+        '--sign-classes',
+        type=str,
+        default=None,
+        help="Comma-separated YOLO class names that should be refined with the traffic-sign classifier.",
+    )
+    parser.add_argument(
+        '--conf',
+        type=float,
+        default=0.35,
+        help="Confidence threshold to filter YOLO detections before visualizing.",
+    )
+
     args = parser.parse_args()
 
-    # MODIFICATION: Parse the display_size argument string into a tuple.
-    display_dimensions = None
-    if args.display_size:
-        try:
-            width, height = map(int, args.display_size.split('x'))
-            display_dimensions = (width, height)
-        except ValueError:
-            print("ERROR: Invalid format for --display-size. Please use WIDTHxHEIGHT, e.g., '1280x720'.")
-            exit()
-    
-    main(args.video, args.yolo, args.resnet, display_dimensions)
+    try:
+        display_dimensions = parse_display_size(args.display_size)
+    except ValueError as err:
+        print(f"ERROR: {err}")
+        raise SystemExit(1)
+
+    override_sign_labels = parse_sign_labels(args.sign_classes)
+
+    main(
+        args.video,
+        args.yolo,
+        args.resnet,
+        display_dimensions,
+        override_sign_labels,
+        args.conf,
+    )
