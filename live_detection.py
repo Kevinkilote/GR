@@ -8,12 +8,46 @@ import os
 import queue
 import threading
 import time
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pygame
 
 import manual_control_steeringwheel as base
+import torch
+import torch.nn.functional as F
+import torchvision
+from PIL import Image
+from torchvision import transforms
+
+from traffic_sign_recognition import DEFAULT_SIGN_LABELS, RESNET_CLASS_NAMES
+
+
+BOX_COLOR_MAP: Dict[str, Tuple[int, int, int]] = {
+    'traffic sign': (0, 255, 0),
+    'traffic light': (255, 255, 0),
+    'vehicle': (0, 170, 255),
+    'car': (0, 170, 255),
+}
+DEFAULT_BOX_COLOR: Tuple[int, int, int] = (255, 255, 255)
+
+
+def parse_sign_labels_arg(raw: Optional[str]) -> Set[str]:
+    if raw is None:
+        return set(DEFAULT_SIGN_LABELS)
+    normalized = raw.strip().lower()
+    if normalized in {'', 'none', 'off'}:
+        return set()
+    labels = {label.strip().lower() for label in raw.split(',') if label.strip()}
+    return labels
+
+
+@dataclass(frozen=True)
+class DetectionItem:
+    bbox: Tuple[int, int, int, int]
+    text: str
+    color: Tuple[int, int, int]
 
 
 class DetectionContext:
@@ -26,6 +60,8 @@ class DetectionContext:
         iou: float = 0.45,
         device: Optional[str] = None,
         min_interval: float = 0.1,
+        resnet_path: Optional[str] = None,
+        sign_labels: Optional[Set[str]] = None,
     ) -> None:
         self.weights_path = weights_path
         self.confidence = conf
@@ -36,11 +72,17 @@ class DetectionContext:
         self._model = None
         self._load_error: Optional[Exception] = None
         self._last_inference_time = 0.0
-        self._last_result = None
+        self._last_result: Optional[Tuple[DetectionItem, ...]] = None
         self._result_lock = threading.Lock()
         self._frame_queue: Optional[queue.Queue] = None
         self._stop_event: Optional[threading.Event] = None
         self._thread: Optional[threading.Thread] = None
+        self._class_map: Optional[Dict[int, str]] = None
+        self._resnet_path = resnet_path
+        self._sign_labels = {label.lower() for label in (sign_labels or set())}
+        self._resnet_model = None
+        self._resnet_transform = None
+        self._torch_device: Optional[torch.device] = None
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
@@ -50,6 +92,8 @@ class DetectionContext:
             return True, None
         try:
             self._ensure_model()
+            if self._sign_labels:
+                self._ensure_sign_recognizer()
             self._start_worker()
             self.active = True
             return True, None
@@ -68,6 +112,13 @@ class DetectionContext:
         except ImportError as exc:
             raise ImportError("ultralytics package is required for live detection") from exc
         self._model = YOLO(self.weights_path)
+        names_attr = getattr(self._model, 'names', None)
+        if isinstance(names_attr, dict):
+            self._class_map = {int(idx): name for idx, name in names_attr.items()}
+        elif isinstance(names_attr, Sequence):
+            self._class_map = {idx: name for idx, name in enumerate(names_attr)}
+        else:
+            self._class_map = {}
         return self._model
 
     def submit_frame(self, frame_rgb: np.ndarray) -> None:
@@ -75,18 +126,17 @@ class DetectionContext:
             return
         if not isinstance(frame_rgb, np.ndarray):
             return
-        # Drop older frame if the worker is still busy.
-        try:
-            while True:
+        if self._frame_queue.full():
+            try:
                 self._frame_queue.get_nowait()
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                pass
         try:
-            self._frame_queue.put_nowait(frame_rgb.copy())
+            self._frame_queue.put_nowait(frame_rgb)
         except queue.Full:
             logging.getLogger(__name__).debug('Detection frame queue is full; dropping frame')
 
-    def get_latest_result(self):
+    def get_latest_result(self) -> Optional[Tuple[DetectionItem, ...]]:
         with self._result_lock:
             return self._last_result
 
@@ -124,6 +174,12 @@ class DetectionContext:
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error('Failed to load YOLO model: %s', exc)
                 return
+        if self._sign_labels:
+            try:
+                self._ensure_sign_recognizer()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error('Failed to load ResNet model: %s', exc)
+                self._sign_labels = set()
         last_inference = 0.0
         assert self._frame_queue is not None
         assert self._stop_event is not None
@@ -132,6 +188,7 @@ class DetectionContext:
                 frame_rgb = self._frame_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
+            frame_rgb = np.ascontiguousarray(frame_rgb)
             now = time.time()
             if now - last_inference < self.min_interval:
                 continue
@@ -148,24 +205,103 @@ class DetectionContext:
                 continue
             last_inference = now
             with self._result_lock:
-                self._last_result = results[0] if results else None
+                if results:
+                    items = self._build_detection_items(results[0], frame_rgb)
+                    self._last_result = tuple(items)
+                else:
+                    self._last_result = tuple()
                 self._last_inference_time = last_inference
+
+    def _ensure_sign_recognizer(self) -> None:
+        if self._resnet_model is not None or not self._resnet_path:
+            return
+        if not os.path.exists(self._resnet_path):
+            logging.getLogger(__name__).warning('ResNet weights not found at %s; disabling sign recognition', self._resnet_path)
+            self._sign_labels = set()
+            return
+        if self._torch_device is None:
+            if self.device:
+                self._torch_device = torch.device(self.device)
+            else:
+                self._torch_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        resnet_model = torchvision.models.resnet18(weights=None)
+        num_ftrs = resnet_model.fc.in_features
+        resnet_model.fc = torch.nn.Linear(num_ftrs, len(RESNET_CLASS_NAMES))
+        state_dict = torch.load(self._resnet_path, map_location=self._torch_device)
+        resnet_model.load_state_dict(state_dict)
+        self._resnet_model = resnet_model.to(self._torch_device)
+        self._resnet_model.eval()
+        self._resnet_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def _build_detection_items(self, result, frame_rgb: np.ndarray) -> Tuple[DetectionItem, ...]:
+        boxes = getattr(result, 'boxes', None)
+        if boxes is None or len(boxes) == 0:
+            return tuple()
+        class_map = self._class_map or {}
+        frame_height, frame_width = frame_rgb.shape[:2]
+        np_boxes = boxes.xyxy.cpu().numpy().astype(int)
+        scores = boxes.conf.cpu().numpy()
+        classes = boxes.cls.cpu().numpy().astype(int)
+        items = []
+        for bbox, score, cls_idx in zip(np_boxes, scores, classes):
+            x1, y1, x2, y2 = bbox
+            x1 = max(0, min(frame_width - 1, x1))
+            y1 = max(0, min(frame_height - 1, y1))
+            x2 = max(0, min(frame_width - 1, x2))
+            y2 = max(0, min(frame_height - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            raw_label = class_map.get(int(cls_idx), f'class_{cls_idx}')
+            label_lower = raw_label.lower()
+            text = f"{raw_label} {score:.2f}"
+            color = self._resolve_color(label_lower)
+            if label_lower in self._sign_labels and self._resnet_model is not None and self._resnet_transform is not None:
+                classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2))
+                if classified is not None:
+                    sign_label, confidence = classified
+                    text = f"{sign_label} {confidence:.2f}"
+                    color = self._resolve_color('traffic sign')
+            items.append(DetectionItem(bbox=(x1, y1, x2, y2), text=text, color=color))
+        return tuple(items)
+
+    @staticmethod
+    def _resolve_color(label_lower: str) -> Tuple[int, int, int]:
+        return BOX_COLOR_MAP.get(label_lower, DEFAULT_BOX_COLOR)
+
+    def _classify_sign(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[Tuple[str, float]]:
+        if self._resnet_model is None or self._resnet_transform is None or self._torch_device is None:
+            return None
+        x1, y1, x2, y2 = bbox
+        cropped = frame_rgb[y1:y2, x1:x2]
+        if cropped.size == 0:
+            return None
+        image = Image.fromarray(cropped)
+        input_tensor = self._resnet_transform(image).unsqueeze(0).to(self._torch_device)
+        with torch.no_grad():
+            output = self._resnet_model(input_tensor)
+            probabilities = F.softmax(output, dim=1)
+            confidence, predicted_idx = torch.max(probabilities, dim=1)
+        return RESNET_CLASS_NAMES[predicted_idx.item()], float(confidence.item())
 
 
 
 class LiveDetectionCameraManager(base.CameraManager):
     """Camera manager that overlays YOLO detections when enabled."""
 
-    BOX_COLOR = (0, 255, 0)
     BOX_WIDTH = 2
     BG_COLOR = (20, 20, 20)
+    LABEL_CACHE_MAX = 64
 
     def __init__(self, parent_actor, hud, detection: DetectionContext):
         super().__init__(parent_actor, hud)
         self._detection = detection
         self._label_font = pygame.font.Font(pygame.font.get_default_font(), 18)
-        self._class_names = None
         self._surface_size: Optional[Tuple[int, int]] = None
+        self._label_cache: Dict[str, pygame.Surface] = {}
 
     def set_sensor(self, index, notify=True):  # noqa: D401 (interface inherited)
         index = index % len(self.sensors)
@@ -211,11 +347,11 @@ class LiveDetectionCameraManager(base.CameraManager):
         rgb_array = array[:, :, ::-1]
         self._detection.submit_frame(rgb_array)
         surface = self._ensure_surface(image.width, image.height)
-        pygame.surfarray.blit_array(surface, rgb_array.swapaxes(0, 1))
+        pixel_array = pygame.surfarray.pixels3d(surface)
+        np.copyto(pixel_array, rgb_array.swapaxes(0, 1))
+        del pixel_array
         detection_result = self._detection.get_latest_result()
-        if detection_result and getattr(detection_result, "boxes", None):
-            if self._class_names is None and hasattr(detection_result, "names"):
-                self._class_names = detection_result.names
+        if detection_result:
             self._draw_detections(surface, detection_result)
         self.surface = surface
 
@@ -226,13 +362,10 @@ class LiveDetectionCameraManager(base.CameraManager):
             self._surface_size = size
         return self.surface
 
-    def _draw_detections(self, surface: pygame.Surface, detection_result) -> None:
-        boxes = detection_result.boxes.xyxy.cpu().numpy()
-        scores = detection_result.boxes.conf.cpu().numpy()
-        classes = detection_result.boxes.cls.cpu().numpy().astype(int)
+    def _draw_detections(self, surface: pygame.Surface, detections: Sequence[DetectionItem]) -> None:
         width, height = surface.get_width(), surface.get_height()
-        for bbox, score, cls_idx in zip(boxes, scores, classes):
-            x1, y1, x2, y2 = bbox.astype(int)
+        for detection in detections:
+            x1, y1, x2, y2 = detection.bbox
             x1 = max(0, min(width - 1, x1))
             y1 = max(0, min(height - 1, y1))
             x2 = max(0, min(width - 1, x2))
@@ -240,23 +373,25 @@ class LiveDetectionCameraManager(base.CameraManager):
             if x2 <= x1 or y2 <= y1:
                 continue
             rect = pygame.Rect(x1, y1, x2 - x1, y2 - y1)
-            pygame.draw.rect(surface, self.BOX_COLOR, rect, self.BOX_WIDTH)
-            label = f"{self._resolve_name(cls_idx)} {score:.2f}"
-            self._draw_label(surface, rect, label)
+            pygame.draw.rect(surface, detection.color, rect, self.BOX_WIDTH)
+            self._draw_label(surface, rect, detection.text)
 
     def _draw_label(self, surface: pygame.Surface, rect: pygame.Rect, label: str) -> None:
-        text_surface = self._label_font.render(label, True, (255, 255, 255))
-        text_bg = pygame.Surface((text_surface.get_width() + 6, text_surface.get_height() + 4))
-        text_bg.fill(self.BG_COLOR)
-        text_bg.blit(text_surface, (3, 2))
-        surface.blit(text_bg, (rect.x, max(0, rect.y - text_surface.get_height() - 4)))
+        label_surface = self._get_label_surface(label)
+        surface.blit(label_surface, (rect.x, max(0, rect.y - label_surface.get_height())))
 
-    def _resolve_name(self, cls_idx: int) -> str:
-        if isinstance(self._class_names, dict) and cls_idx in self._class_names:
-            return str(self._class_names[cls_idx])
-        if isinstance(self._class_names, (list, tuple)) and 0 <= cls_idx < len(self._class_names):
-            return str(self._class_names[cls_idx])
-        return f"cls_{cls_idx}"
+    def _get_label_surface(self, label: str) -> pygame.Surface:
+        cached = self._label_cache.get(label)
+        if cached is None:
+            text_surface = self._label_font.render(label, True, (255, 255, 255))
+            label_surface = pygame.Surface((text_surface.get_width() + 6, text_surface.get_height() + 6), pygame.SRCALPHA)
+            label_surface.fill((*self.BG_COLOR, 200))
+            label_surface.blit(text_surface, (3, 3))
+            if len(self._label_cache) >= self.LABEL_CACHE_MAX:
+                self._label_cache.clear()
+            self._label_cache[label] = label_surface
+            cached = label_surface
+        return cached.copy()
 
 
 class LiveDetectionWorld(base.World):
@@ -380,6 +515,8 @@ def game_loop(args):
         iou=args.iou,
         device=args.device,
         min_interval=args.detection_interval,
+        resnet_path=args.resnet,
+        sign_labels=args.sign_labels,
     )
     try:
         client = base.carla.Client(args.host, args.port)
@@ -414,6 +551,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--res', metavar='WIDTHxHEIGHT', default='1280x720', help='window resolution (default: 1280x720)')
     parser.add_argument('--filter', metavar='PATTERN', default='vehicle.*', help='actor filter (default: "vehicle.*")')
     parser.add_argument('--weights', default='best.pt', help='path to YOLOv11 weights (default: best.pt)')
+    parser.add_argument('--resnet', default='best_traffic_sign_classifier_advanced.pth', help='path to traffic sign ResNet weights (default: best_traffic_sign_classifier_advanced.pth; use "none" to disable)')
+    parser.add_argument('--sign-labels', default=None, help='comma-separated YOLO class names to refine with ResNet (default uses known traffic sign labels)')
     parser.add_argument('--conf', default=0.25, type=float, help='YOLO confidence threshold (default: 0.25)')
     parser.add_argument('--iou', default=0.45, type=float, help='YOLO IoU threshold (default: 0.45)')
     parser.add_argument('--device', default=None, help='Torch device for YOLO (e.g., cuda:0)')
@@ -424,6 +563,9 @@ def parse_args() -> argparse.Namespace:
     args.width, args.height = [int(x) for x in args.res.split('x')]
     if args.detect_button is not None and args.detect_button < 0:
         args.detect_button = None
+    if args.resnet and args.resnet.strip().lower() == 'none':
+        args.resnet = None
+    args.sign_labels = parse_sign_labels_arg(args.sign_labels)
     return args
 
 
