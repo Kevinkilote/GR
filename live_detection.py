@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pygame
@@ -50,6 +50,20 @@ class DetectionItem:
     color: Tuple[int, int, int]
 
 
+@dataclass(frozen=True)
+class DetectionSnapshot:
+    items: Tuple[DetectionItem, ...]
+    timestamp: float
+
+
+@dataclass(frozen=True)
+class SignCacheEntry:
+    bbox: Tuple[int, int, int, int]
+    label: str
+    confidence: float
+    timestamp: float
+
+
 class DetectionContext:
     """Lazy loads a YOLO model and throttles inference for live overlays."""
 
@@ -62,17 +76,22 @@ class DetectionContext:
         min_interval: float = 0.1,
         resnet_path: Optional[str] = None,
         sign_labels: Optional[Set[str]] = None,
+        display_ttl: float = 0.3,
+        sign_cache_ttl: float = 0.75,
     ) -> None:
         self.weights_path = weights_path
         self.confidence = conf
         self.iou = iou
         self.device = device
         self.min_interval = max(0.0, min_interval)
+        self.display_ttl = max(0.05, display_ttl)
+        self.sign_cache_ttl = max(0.1, sign_cache_ttl)
         self.active = False
         self._model = None
         self._load_error: Optional[Exception] = None
         self._last_inference_time = 0.0
-        self._last_result: Optional[Tuple[DetectionItem, ...]] = None
+        self._last_snapshot: Optional[DetectionSnapshot] = None
+        self._last_nonempty_snapshot: Optional[DetectionSnapshot] = None
         self._result_lock = threading.Lock()
         self._frame_queue: Optional[queue.Queue] = None
         self._stop_event: Optional[threading.Event] = None
@@ -83,6 +102,7 @@ class DetectionContext:
         self._resnet_model = None
         self._resnet_transform = None
         self._torch_device: Optional[torch.device] = None
+        self._sign_cache: List[SignCacheEntry] = []
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
@@ -94,6 +114,7 @@ class DetectionContext:
             self._ensure_model()
             if self._sign_labels:
                 self._ensure_sign_recognizer()
+                self._sign_cache.clear()
             self._start_worker()
             self.active = True
             return True, None
@@ -138,11 +159,34 @@ class DetectionContext:
 
     def get_latest_result(self) -> Optional[Tuple[DetectionItem, ...]]:
         with self._result_lock:
-            return self._last_result
+            snapshot = self._last_snapshot
+            last_nonempty = self._last_nonempty_snapshot
+        if snapshot is None and last_nonempty is None:
+            return None
+        now = time.time()
+        if snapshot is not None:
+            age = now - snapshot.timestamp
+            if snapshot.items:
+                if age <= self.display_ttl:
+                    return snapshot.items
+            else:
+                if last_nonempty is not None:
+                    nonempty_age = now - last_nonempty.timestamp
+                    if nonempty_age <= self.display_ttl:
+                        return last_nonempty.items
+                if age <= self.display_ttl:
+                    return tuple()
+                return tuple()
+        if last_nonempty is not None:
+            nonempty_age = now - last_nonempty.timestamp
+            if nonempty_age <= self.display_ttl:
+                return last_nonempty.items
+        return tuple()
 
     def shutdown(self) -> None:
         self._stop_worker()
         self.active = False
+        self._sign_cache.clear()
 
     def _start_worker(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -150,7 +194,8 @@ class DetectionContext:
         self._stop_event = threading.Event()
         self._frame_queue = queue.Queue(maxsize=1)
         with self._result_lock:
-            self._last_result = None
+            self._last_snapshot = None
+            self._last_nonempty_snapshot = None
         self._thread = threading.Thread(target=self._worker, name='yolo_detection_worker', daemon=True)
         self._thread.start()
 
@@ -163,7 +208,8 @@ class DetectionContext:
         self._stop_event = None
         self._frame_queue = None
         with self._result_lock:
-            self._last_result = None
+            self._last_snapshot = None
+            self._last_nonempty_snapshot = None
 
     def _worker(self) -> None:
         logger = logging.getLogger(__name__)
@@ -200,16 +246,19 @@ class DetectionContext:
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error('YOLO inference failed: %s', exc)
                 with self._result_lock:
-                    self._last_result = None
+                    self._last_snapshot = None
+                    self._last_nonempty_snapshot = None
                 self._load_error = exc
                 continue
             last_inference = now
             with self._result_lock:
+                items = ()
                 if results:
-                    items = self._build_detection_items(results[0], frame_rgb)
-                    self._last_result = tuple(items)
-                else:
-                    self._last_result = tuple()
+                    items = self._build_detection_items(results[0], frame_rgb, last_inference)
+                snapshot = DetectionSnapshot(items=tuple(items), timestamp=last_inference)
+                self._last_snapshot = snapshot
+                if snapshot.items:
+                    self._last_nonempty_snapshot = snapshot
                 self._last_inference_time = last_inference
 
     def _ensure_sign_recognizer(self) -> None:
@@ -237,7 +286,7 @@ class DetectionContext:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-    def _build_detection_items(self, result, frame_rgb: np.ndarray) -> Tuple[DetectionItem, ...]:
+    def _build_detection_items(self, result, frame_rgb: np.ndarray, timestamp: float) -> Tuple[DetectionItem, ...]:
         boxes = getattr(result, 'boxes', None)
         if boxes is None or len(boxes) == 0:
             return tuple()
@@ -260,7 +309,7 @@ class DetectionContext:
             text = f"{raw_label} {score:.2f}"
             color = self._resolve_color(label_lower)
             if label_lower in self._sign_labels and self._resnet_model is not None and self._resnet_transform is not None:
-                classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2))
+                classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2), timestamp)
                 if classified is not None:
                     sign_label, confidence = classified
                     text = f"{sign_label} {confidence:.2f}"
@@ -272,9 +321,12 @@ class DetectionContext:
     def _resolve_color(label_lower: str) -> Tuple[int, int, int]:
         return BOX_COLOR_MAP.get(label_lower, DEFAULT_BOX_COLOR)
 
-    def _classify_sign(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[Tuple[str, float]]:
+    def _classify_sign(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[Tuple[str, float]]:
         if self._resnet_model is None or self._resnet_transform is None or self._torch_device is None:
             return None
+        cached = self._lookup_sign_cache(bbox, timestamp)
+        if cached is not None:
+            return cached.label, cached.confidence
         x1, y1, x2, y2 = bbox
         cropped = frame_rgb[y1:y2, x1:x2]
         if cropped.size == 0:
@@ -285,7 +337,49 @@ class DetectionContext:
             output = self._resnet_model(input_tensor)
             probabilities = F.softmax(output, dim=1)
             confidence, predicted_idx = torch.max(probabilities, dim=1)
-        return RESNET_CLASS_NAMES[predicted_idx.item()], float(confidence.item())
+        label = RESNET_CLASS_NAMES[predicted_idx.item()]
+        confidence_value = float(confidence.item())
+        self._update_sign_cache(bbox, label, confidence_value, timestamp)
+        return label, confidence_value
+
+    def _lookup_sign_cache(self, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[SignCacheEntry]:
+        if not self._sign_cache:
+            return None
+        retained: List[SignCacheEntry] = []
+        best_entry: Optional[SignCacheEntry] = None
+        best_iou = 0.0
+        for entry in self._sign_cache:
+            if timestamp - entry.timestamp > self.sign_cache_ttl:
+                continue
+            retained.append(entry)
+            iou = self._compute_iou(bbox, entry.bbox)
+            if iou > 0.55 and iou > best_iou:
+                best_entry = entry
+                best_iou = iou
+        self._sign_cache = retained
+        return best_entry
+
+    def _update_sign_cache(self, bbox: Tuple[int, int, int, int], label: str, confidence: float, timestamp: float) -> None:
+        entry = SignCacheEntry(bbox=bbox, label=label, confidence=confidence, timestamp=timestamp)
+        self._sign_cache.append(entry)
+        if len(self._sign_cache) > 32:
+            self._sign_cache = self._sign_cache[-32:]
+
+    @staticmethod
+    def _compute_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+            return 0.0
+        inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        union = area_a + area_b - inter_area
+        return inter_area / union if union > 0 else 0.0
 
 
 
@@ -515,6 +609,8 @@ def game_loop(args):
         min_interval=args.detection_interval,
         resnet_path=args.resnet,
         sign_labels=args.sign_labels,
+        display_ttl=args.display_ttl,
+        sign_cache_ttl=args.sign_cache_ttl,
     )
     try:
         client = base.carla.Client(args.host, args.port)
@@ -554,7 +650,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--conf', default=0.25, type=float, help='YOLO confidence threshold (default: 0.25)')
     parser.add_argument('--iou', default=0.45, type=float, help='YOLO IoU threshold (default: 0.45)')
     parser.add_argument('--device', default=None, help='Torch device for YOLO (e.g., cuda:0)')
-    parser.add_argument('--detection-interval', default=0.1, type=float, help='minimum seconds between YOLO inferences (default: 0.1)')
+    parser.add_argument('--detection-interval', default=0.05, type=float, help='minimum seconds between YOLO inferences (default: 0.05)')
+    parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep last detections on screen (default: 0.3)')
+    parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
     parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     args = parser.parse_args()
@@ -564,6 +662,8 @@ def parse_args() -> argparse.Namespace:
     if args.resnet and args.resnet.strip().lower() == 'none':
         args.resnet = None
     args.sign_labels = parse_sign_labels_arg(args.sign_labels)
+    args.display_ttl = max(0.05, args.display_ttl)
+    args.sign_cache_ttl = max(0.1, args.sign_cache_ttl)
     return args
 
 
