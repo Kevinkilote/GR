@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import queue
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -35,14 +37,20 @@ class DetectionContext:
         self._load_error: Optional[Exception] = None
         self._last_inference_time = 0.0
         self._last_result = None
+        self._result_lock = threading.Lock()
+        self._frame_queue: Optional[queue.Queue] = None
+        self._stop_event: Optional[threading.Event] = None
+        self._thread: Optional[threading.Thread] = None
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
         if self.active:
+            self._stop_worker()
             self.active = False
             return True, None
         try:
             self._ensure_model()
+            self._start_worker()
             self.active = True
             return True, None
         except Exception as exc:  # pylint: disable=broad-except
@@ -62,25 +70,87 @@ class DetectionContext:
         self._model = YOLO(self.weights_path)
         return self._model
 
-    def infer(self, frame_rgb: np.ndarray):
-        if not self.active or self._model is None:
-            return self._last_result
-        now = time.time()
-        if now - self._last_inference_time < self.min_interval:
-            return self._last_result
-        inference_kwargs = dict(conf=self.confidence, iou=self.iou, verbose=False)
-        if self.device:
-            inference_kwargs["device"] = self.device
+    def submit_frame(self, frame_rgb: np.ndarray) -> None:
+        if not self.active or self._frame_queue is None:
+            return
+        if not isinstance(frame_rgb, np.ndarray):
+            return
+        # Drop older frame if the worker is still busy.
         try:
-            results = self._model(frame_rgb[:, :, ::-1], **inference_kwargs)
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.getLogger(__name__).error('YOLO inference failed: %s', exc)
+            while True:
+                self._frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._frame_queue.put_nowait(frame_rgb.copy())
+        except queue.Full:
+            logging.getLogger(__name__).debug('Detection frame queue is full; dropping frame')
+
+    def get_latest_result(self):
+        with self._result_lock:
+            return self._last_result
+
+    def shutdown(self) -> None:
+        self._stop_worker()
+        self.active = False
+
+    def _start_worker(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event = threading.Event()
+        self._frame_queue = queue.Queue(maxsize=1)
+        with self._result_lock:
             self._last_result = None
-            self.active = False
-            return None
-        self._last_inference_time = now
-        self._last_result = results[0] if results else None
-        return self._last_result
+        self._thread = threading.Thread(target=self._worker, name='yolo_detection_worker', daemon=True)
+        self._thread.start()
+
+    def _stop_worker(self) -> None:
+        if self._stop_event:
+            self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+        self._stop_event = None
+        self._frame_queue = None
+        with self._result_lock:
+            self._last_result = None
+
+    def _worker(self) -> None:
+        logger = logging.getLogger(__name__)
+        if self._model is None:
+            # Model should already be loaded, but guard anyway.
+            try:
+                self._ensure_model()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error('Failed to load YOLO model: %s', exc)
+                return
+        last_inference = 0.0
+        assert self._frame_queue is not None
+        assert self._stop_event is not None
+        while not self._stop_event.is_set():
+            try:
+                frame_rgb = self._frame_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            now = time.time()
+            if now - last_inference < self.min_interval:
+                continue
+            inference_kwargs = dict(conf=self.confidence, iou=self.iou, verbose=False)
+            if self.device:
+                inference_kwargs["device"] = self.device
+            try:
+                results = self._model(frame_rgb[:, :, ::-1], **inference_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error('YOLO inference failed: %s', exc)
+                with self._result_lock:
+                    self._last_result = None
+                self._load_error = exc
+                continue
+            last_inference = now
+            with self._result_lock:
+                self._last_result = results[0] if results else None
+                self._last_inference_time = last_inference
+
 
 
 class LiveDetectionCameraManager(base.CameraManager):
@@ -95,6 +165,7 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._detection = detection
         self._label_font = pygame.font.Font(pygame.font.get_default_font(), 18)
         self._class_names = None
+        self._surface_size: Optional[Tuple[int, int]] = None
 
     def set_sensor(self, index, notify=True):  # noqa: D401 (interface inherited)
         index = index % len(self.sensors)
@@ -138,13 +209,22 @@ class LiveDetectionCameraManager(base.CameraManager):
         array = np.reshape(array, (image.height, image.width, 4))
         array = array[:, :, :3]
         rgb_array = array[:, :, ::-1]
-        detection_result = self._detection.infer(rgb_array)
-        surface = pygame.surfarray.make_surface(rgb_array.swapaxes(0, 1))
+        self._detection.submit_frame(rgb_array)
+        surface = self._ensure_surface(image.width, image.height)
+        pygame.surfarray.blit_array(surface, rgb_array.swapaxes(0, 1))
+        detection_result = self._detection.get_latest_result()
         if detection_result and getattr(detection_result, "boxes", None):
             if self._class_names is None and hasattr(detection_result, "names"):
                 self._class_names = detection_result.names
             self._draw_detections(surface, detection_result)
         self.surface = surface
+
+    def _ensure_surface(self, width: int, height: int) -> pygame.Surface:
+        size = (width, height)
+        if self.surface is None or self._surface_size != size:
+            self.surface = pygame.Surface(size).convert()
+            self._surface_size = size
+        return self.surface
 
     def _draw_detections(self, surface: pygame.Surface, detection_result) -> None:
         boxes = detection_result.boxes.xyxy.cpu().numpy()
@@ -322,6 +402,7 @@ def game_loop(args):
     finally:
         if world is not None:
             world.destroy()
+        detection_context.shutdown()
         pygame.quit()
 
 
@@ -337,7 +418,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--iou', default=0.45, type=float, help='YOLO IoU threshold (default: 0.45)')
     parser.add_argument('--device', default=None, help='Torch device for YOLO (e.g., cuda:0)')
     parser.add_argument('--detection-interval', default=0.1, type=float, help='minimum seconds between YOLO inferences (default: 0.1)')
-    parser.add_argument('--detect-button', default=5, type=int, help='joystick button index to toggle detection (default: 5, set -1 to disable)')
+    parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     args = parser.parse_args()
     args.width, args.height = [int(x) for x in args.res.split('x')]
