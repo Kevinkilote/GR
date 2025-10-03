@@ -347,9 +347,15 @@ class LiveDetectionCameraManager(base.CameraManager):
         rgb_array = array[:, :, ::-1]
         self._detection.submit_frame(rgb_array)
         surface = self._ensure_surface(image.width, image.height)
-        pixel_array = pygame.surfarray.pixels3d(surface)
-        np.copyto(pixel_array, rgb_array.swapaxes(0, 1))
-        del pixel_array
+        surface.lock()
+        pixel_array = None
+        try:
+            pixel_array = pygame.surfarray.pixels3d(surface)
+            np.copyto(pixel_array, rgb_array.swapaxes(0, 1))
+        finally:
+            if pixel_array is not None:
+                del pixel_array
+            surface.unlock()
         detection_result = self._detection.get_latest_result()
         if detection_result:
             self._draw_detections(surface, detection_result)
