@@ -22,7 +22,7 @@ from PIL import Image
 from torchvision import transforms
 
 from tracker import IOUTracker
-from traffic_sign_recognition import DEFAULT_SIGN_LABELS, RESNET_CLASS_NAMES
+from traffic_sign_recognition import DEFAULT_SIGN_LABELS, OTHER_SIGN_LABEL, RESNET_CLASS_NAMES
 
 
 BOX_COLOR_MAP: Dict[str, Tuple[int, int, int]] = {
@@ -30,6 +30,7 @@ BOX_COLOR_MAP: Dict[str, Tuple[int, int, int]] = {
     'traffic light': (255, 255, 0),
     'vehicle': (0, 170, 255),
     'car': (0, 170, 255),
+    OTHER_SIGN_LABEL: (160, 160, 160),
 }
 DEFAULT_BOX_COLOR: Tuple[int, int, int] = (255, 255, 255)
 
@@ -79,6 +80,7 @@ class DetectionContext:
         sign_labels: Optional[Set[str]] = None,
         display_ttl: float = 0.3,
         sign_cache_ttl: float = 0.75,
+        sign_confidence_threshold: float = 0.6,
     ) -> None:
         self.weights_path = weights_path
         self.confidence = conf
@@ -87,6 +89,7 @@ class DetectionContext:
         self.min_interval = max(0.0, min_interval)
         self.display_ttl = max(0.05, display_ttl)
         self.sign_cache_ttl = max(0.1, sign_cache_ttl)
+        self.sign_conf_threshold = max(0.0, sign_confidence_threshold)
         self.active = False
         self._model = None
         self._load_error: Optional[Exception] = None
@@ -313,8 +316,13 @@ class DetectionContext:
                 classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2), timestamp)
                 if classified is not None:
                     sign_label, confidence = classified
-                    text = f"{sign_label} {confidence:.2f}"
-                    color = self._resolve_color('traffic sign')
+                    display_label = self._format_sign_label(sign_label)
+                    if sign_label == OTHER_SIGN_LABEL:
+                        text = display_label
+                        color = self._resolve_color(OTHER_SIGN_LABEL)
+                    else:
+                        text = f"{display_label} {confidence:.2f}"
+                        color = self._resolve_color('traffic sign')
             items.append(DetectionItem(bbox=(x1, y1, x2, y2), text=text, color=color))
         return tuple(items)
 
@@ -340,6 +348,8 @@ class DetectionContext:
             confidence, predicted_idx = torch.max(probabilities, dim=1)
         label = RESNET_CLASS_NAMES[predicted_idx.item()]
         confidence_value = float(confidence.item())
+        if confidence_value < self.sign_conf_threshold:
+            return OTHER_SIGN_LABEL, confidence_value
         self._update_sign_cache(bbox, label, confidence_value, timestamp)
         return label, confidence_value
 
@@ -358,6 +368,8 @@ class DetectionContext:
                 best_entry = entry
                 best_iou = iou
         self._sign_cache = retained
+        if best_entry and best_entry.label == OTHER_SIGN_LABEL:
+            return None
         return best_entry
 
     def _update_sign_cache(self, bbox: Tuple[int, int, int, int], label: str, confidence: float, timestamp: float) -> None:
@@ -381,6 +393,13 @@ class DetectionContext:
         area_b = (bx2 - bx1) * (by2 - by1)
         union = area_a + area_b - inter_area
         return inter_area / union if union > 0 else 0.0
+
+    @staticmethod
+    def _format_sign_label(label: str) -> str:
+        if label == OTHER_SIGN_LABEL:
+            return 'Other Sign'
+        parts = label.replace('--', ' ').replace('-', ' ').replace('_', ' ').split()
+        return ' '.join(part.capitalize() for part in parts)
 
 
 
@@ -635,6 +654,7 @@ def game_loop(args):
         sign_labels=args.sign_labels,
         display_ttl=args.display_ttl,
         sign_cache_ttl=args.sign_cache_ttl,
+        sign_confidence_threshold=args.sign_conf_threshold,
     )
     try:
         client = base.carla.Client(args.host, args.port)
@@ -677,6 +697,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--detection-interval', default=0.05, type=float, help='minimum seconds between YOLO inferences (default: 0.05)')
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep last detections on screen (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
+    parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
     parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     args = parser.parse_args()
@@ -688,6 +709,7 @@ def parse_args() -> argparse.Namespace:
     args.sign_labels = parse_sign_labels_arg(args.sign_labels)
     args.display_ttl = max(0.05, args.display_ttl)
     args.sign_cache_ttl = max(0.1, args.sign_cache_ttl)
+    args.sign_conf_threshold = max(0.0, args.sign_conf_threshold)
     return args
 
 

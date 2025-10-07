@@ -16,8 +16,10 @@ import torch.nn.functional as F
 from PIL import Image
 from ultralytics import YOLO
 
+from tracker import IOUTracker
 from traffic_sign_recognition import (
     DEFAULT_SIGN_LABELS,
+    OTHER_SIGN_LABEL,
     RESNET_CLASS_NAMES,
     ResNetBundle,
     load_resnet,
@@ -51,6 +53,7 @@ BOX_COLOR_MAP = {
     'traffic light': (0, 255, 255),   # yellow
     'vehicle': (0, 170, 255),         # orange/blue-ish
     'car': (0, 170, 255),
+    OTHER_SIGN_LABEL: (160, 160, 160),
 }
 DEFAULT_BOX_COLOR = (255, 255, 255)
 
@@ -70,6 +73,7 @@ class VideoDetectionPipeline:
         detection_interval: float,
         display_ttl: float,
         sign_cache_ttl: float,
+        sign_conf_threshold: float,
     ) -> None:
         if not os.path.exists(yolo_weights):
             raise FileNotFoundError(f"YOLO weights not found: {yolo_weights}")
@@ -90,6 +94,7 @@ class VideoDetectionPipeline:
         self._detection_interval = max(0.0, detection_interval)
         self._display_ttl = max(0.05, display_ttl)
         self._sign_cache_ttl = max(0.1, sign_cache_ttl)
+        self._sign_conf_threshold = max(0.0, sign_conf_threshold)
 
         self._last_timestamp = -float('inf')
         self._last_snapshot: Optional[DetectionSnapshot] = None
@@ -198,8 +203,13 @@ class VideoDetectionPipeline:
                 classified = self._classify_sign(frame_bgr, (x1, y1, x2, y2), timestamp)
                 if classified is not None:
                     sign_label, confidence = classified
-                    text = f"{sign_label} {confidence:.2f}"
-                    color = BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
+                    display_label = self._format_sign_label(sign_label)
+                    if sign_label == OTHER_SIGN_LABEL:
+                        text = display_label
+                        color = BOX_COLOR_MAP.get(OTHER_SIGN_LABEL, DEFAULT_BOX_COLOR)
+                    else:
+                        text = f"{display_label} {confidence:.2f}"
+                        color = BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
 
             items.append(DetectionItem(bbox=(x1, y1, x2, y2), text=text, color=color))
         return tuple(items)
@@ -231,6 +241,8 @@ class VideoDetectionPipeline:
 
         label = RESNET_CLASS_NAMES[predicted_idx.item()]
         confidence_value = float(confidence.item())
+        if confidence_value < self._sign_conf_threshold:
+            return OTHER_SIGN_LABEL, confidence_value
         self._update_sign_cache(bbox, label, confidence_value, timestamp)
         return label, confidence_value
 
@@ -249,6 +261,8 @@ class VideoDetectionPipeline:
                 best_entry = entry
                 best_iou = iou
         self._sign_cache = retained[-32:]
+        if best_entry and best_entry.label == OTHER_SIGN_LABEL:
+            return None
         return best_entry
 
     def _update_sign_cache(self, bbox: Tuple[int, int, int, int], label: str, confidence: float, timestamp: float) -> None:
@@ -285,6 +299,13 @@ class VideoDetectionPipeline:
             cv2.putText(frame_bgr, item.text, (x1 + 5, label_y + label_h + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return frame_bgr
 
+    @staticmethod
+    def _format_sign_label(label: str) -> str:
+        if label == OTHER_SIGN_LABEL:
+            return 'Other Sign'
+        parts = label.replace('--', ' ').replace('-', ' ').replace('_', ' ').split()
+        return ' '.join(part.capitalize() for part in parts)
+
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Run YOLO + ResNet post-analysis over a recorded CARLA video')
@@ -299,6 +320,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--detection-interval', default=0.02, type=float, help='minimum seconds between consecutive YOLO runs (default: 0.02)')
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep detections visible without refresh (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet predictions (default: 0.75)')
+    parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
     parser.add_argument('--no-display', action='store_true', help='disable on-screen display (useful for batch processing)')
     parser.add_argument('--debug', action='store_true', help='enable verbose logging')
     return parser.parse_args(argv)
@@ -331,6 +353,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     )
     resnet_path = None if args.resnet.lower() == 'none' else args.resnet
 
+    sign_conf_threshold = max(0.0, args.sign_conf_threshold)
+
     pipeline = VideoDetectionPipeline(
         yolo_weights=args.weights,
         resnet_weights=resnet_path,
@@ -341,6 +365,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         detection_interval=args.detection_interval,
         display_ttl=args.display_ttl,
         sign_cache_ttl=args.sign_cache_ttl,
+        sign_conf_threshold=sign_conf_threshold,
     )
 
     cap = cv2.VideoCapture(video_path)

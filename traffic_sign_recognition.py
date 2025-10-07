@@ -33,6 +33,7 @@ RESNET_CLASS_NAMES: Sequence[str] = (
 
 # Lower-case YOLO class names that should be refined by the ResNet recogniser by default.
 DEFAULT_SIGN_LABELS = frozenset({'traffic sign'})
+OTHER_SIGN_LABEL = 'other-sign'
 
 # Normalisation applied during training.
 RESNET_TRANSFORM = transforms.Compose([
