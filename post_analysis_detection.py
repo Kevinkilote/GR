@@ -95,6 +95,8 @@ class VideoDetectionPipeline:
         self._last_snapshot: Optional[DetectionSnapshot] = None
         self._last_nonempty_snapshot: Optional[DetectionSnapshot] = None
         self._sign_cache: List[SignCacheEntry] = []
+        tracker_lifetime = int(self._display_ttl / max(0.01, self._detection_interval)) + 5
+        self._tracker = IOUTracker(max_ttl=tracker_lifetime, min_streak=1, iou_threshold=0.3)
 
     @staticmethod
     def _normalise_yolo_names(names: Sequence[str] | dict) -> dict:
