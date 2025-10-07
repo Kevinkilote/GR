@@ -21,6 +21,7 @@ import torchvision
 from PIL import Image
 from torchvision import transforms
 
+from tracker import IOUTracker
 from traffic_sign_recognition import DEFAULT_SIGN_LABELS, RESNET_CLASS_NAMES
 
 
@@ -396,6 +397,7 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._label_font = pygame.font.Font(pygame.font.get_default_font(), 18)
         self._surface_size: Optional[Tuple[int, int]] = None
         self._label_cache: Dict[str, pygame.Surface] = {}
+        self._tracker = IOUTracker(max_ttl=15, min_streak=1, iou_threshold=0.3)
 
     def set_sensor(self, index, notify=True):  # noqa: D401 (interface inherited)
         index = index % len(self.sensors)
@@ -411,6 +413,7 @@ class LiveDetectionCameraManager(base.CameraManager):
             )
             weak_self = base.weakref.ref(self)
             self.sensor.listen(lambda image: LiveDetectionCameraManager._parse_image(weak_self, image))
+            self._tracker.reset()
         if notify:
             self.hud.notification(self.sensors[index][2])
         self.index = index
@@ -443,8 +446,10 @@ class LiveDetectionCameraManager(base.CameraManager):
         surface = self._ensure_surface(image.width, image.height)
         pygame.surfarray.blit_array(surface, np.ascontiguousarray(rgb_array.swapaxes(0, 1)))
         detection_result = self._detection.get_latest_result()
-        if detection_result:
+        if detection_result is not None:
             self._draw_detections(surface, detection_result)
+        else:
+            self._tracker.update([])
         self.surface = surface
 
     def _ensure_surface(self, width: int, height: int) -> pygame.Surface:
@@ -456,6 +461,7 @@ class LiveDetectionCameraManager(base.CameraManager):
 
     def _draw_detections(self, surface: pygame.Surface, detections: Sequence[DetectionItem]) -> None:
         width, height = surface.get_width(), surface.get_height()
+        tracker_inputs = []
         for detection in detections:
             x1, y1, x2, y2 = detection.bbox
             x1 = max(0, min(width - 1, x1))
@@ -464,9 +470,27 @@ class LiveDetectionCameraManager(base.CameraManager):
             y2 = max(0, min(height - 1, y2))
             if x2 <= x1 or y2 <= y1:
                 continue
+            tracker_inputs.append((np.array([x1, y1, x2, y2], dtype=np.float32), detection.text, 1.0, detection.color))
+
+        tracks = self._tracker.update(tracker_inputs)
+
+        if not tracks and tracker_inputs:
+            self._draw_raw_detections(surface, tracker_inputs)
+            return
+
+        for track in tracks:
+            x1, y1, x2, y2 = track.bbox.astype(int)
             rect = pygame.Rect(x1, y1, x2 - x1, y2 - y1)
-            pygame.draw.rect(surface, detection.color, rect, self.BOX_WIDTH)
-            self._draw_label(surface, rect, detection.text)
+            pygame.draw.rect(surface, track.color, rect, self.BOX_WIDTH)
+            label = f"ID {track.track_id}: {track.label}"
+            self._draw_label(surface, rect, label)
+
+    def _draw_raw_detections(self, surface: pygame.Surface, tracker_inputs) -> None:
+        for det_box, det_label, _conf, det_color in tracker_inputs:
+            x1, y1, x2, y2 = det_box.astype(int)
+            rect = pygame.Rect(x1, y1, x2 - x1, y2 - y1)
+            pygame.draw.rect(surface, det_color, rect, self.BOX_WIDTH)
+            self._draw_label(surface, rect, det_label)
 
     def _draw_label(self, surface: pygame.Surface, rect: pygame.Rect, label: str) -> None:
         label_surface = self._get_label_surface(label)

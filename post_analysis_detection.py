@@ -106,7 +106,7 @@ class VideoDetectionPipeline:
         """Run detection for a frame and return annotated copy & detections."""
         if timestamp - self._last_timestamp < self._detection_interval and self._last_snapshot is not None:
             detections = self._resolve_display_items(timestamp)
-            annotated = self._draw(frame_bgr.copy(), detections)
+            annotated = self._render_tracks(frame_bgr.copy(), detections)
             return annotated, detections
 
         results = self._yolo(frame_bgr, conf=self._conf, iou=self._iou, verbose=False)
@@ -121,7 +121,7 @@ class VideoDetectionPipeline:
         self._last_timestamp = timestamp
 
         detections = self._resolve_display_items(timestamp)
-        annotated = self._draw(frame_bgr.copy(), detections)
+        annotated = self._render_tracks(frame_bgr.copy(), detections)
         return annotated, detections
 
     def _resolve_display_items(self, timestamp: float) -> Tuple[DetectionItem, ...]:
@@ -142,6 +142,31 @@ class VideoDetectionPipeline:
             if nonempty_age <= self._display_ttl:
                 return last_nonempty.items
         return tuple()
+
+    def _render_tracks(self, frame_bgr: np.ndarray, detections: Sequence[DetectionItem]) -> np.ndarray:
+        tracker_inputs = []
+        for detection in detections:
+            x1, y1, x2, y2 = detection.bbox
+            tracker_inputs.append((np.array([x1, y1, x2, y2], dtype=np.float32), detection.text, 1.0, detection.color))
+
+        tracks = self._tracker.update(tracker_inputs)
+
+        if not tracks and tracker_inputs:
+            return self._draw_raw(frame_bgr, detections)
+
+        if not tracks:
+            return frame_bgr
+
+        for track in tracks:
+            x1, y1, x2, y2 = track.bbox.astype(int)
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), track.color, 2)
+            label = f"ID {track.track_id}: {track.label}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_w, label_h = label_size
+            label_y = max(0, y1 - label_h - 6)
+            cv2.rectangle(frame_bgr, (x1, label_y), (x1 + label_w + 10, label_y + label_h + 6), (20, 20, 20), -1)
+            cv2.putText(frame_bgr, label, (x1 + 5, label_y + label_h + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        return frame_bgr
 
     def _build_items(self, result, frame_bgr: np.ndarray, timestamp: float) -> Tuple[DetectionItem, ...]:
         boxes = getattr(result, 'boxes', None)
@@ -247,7 +272,7 @@ class VideoDetectionPipeline:
         return inter_area / union if union > 0 else 0.0
 
     @staticmethod
-    def _draw(frame_bgr: np.ndarray, detections: Sequence[DetectionItem]) -> np.ndarray:
+    def _draw_raw(frame_bgr: np.ndarray, detections: Sequence[DetectionItem]) -> np.ndarray:
         for item in detections:
             x1, y1, x2, y2 = item.bbox
             cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), item.color, 2)
