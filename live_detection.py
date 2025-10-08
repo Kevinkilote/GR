@@ -31,6 +31,7 @@ BOX_COLOR_MAP: Dict[str, Tuple[int, int, int]] = {
     'traffic light': (255, 255, 0),
     'vehicle': (0, 170, 255),
     'car': (0, 170, 255),
+    'speed-limit': (0, 220, 0),
     OTHER_SIGN_LABEL: (160, 160, 160),
 }
 DEFAULT_BOX_COLOR: Tuple[int, int, int] = (255, 255, 255)
