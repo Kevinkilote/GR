@@ -22,6 +22,7 @@ from PIL import Image
 from torchvision import transforms
 
 from tracker import IOUTracker
+from speed_limit_ocr import SpeedLimitOCR
 from traffic_sign_recognition import DEFAULT_SIGN_LABELS, OTHER_SIGN_LABEL, RESNET_CLASS_NAMES
 
 
@@ -107,6 +108,7 @@ class DetectionContext:
         self._resnet_transform = None
         self._torch_device: Optional[torch.device] = None
         self._sign_cache: List[SignCacheEntry] = []
+        self._speed_limit_ocr = SpeedLimitOCR()
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
@@ -320,6 +322,9 @@ class DetectionContext:
                     if sign_label == OTHER_SIGN_LABEL:
                         text = display_label
                         color = self._resolve_color(OTHER_SIGN_LABEL)
+                    elif sign_label.startswith('speed-limit-'):
+                        text = f"{display_label} ({confidence:.2f})"
+                        color = self._resolve_color('speed-limit')
                     else:
                         text = f"{display_label} {confidence:.2f}"
                         color = self._resolve_color('traffic sign')
@@ -328,6 +333,8 @@ class DetectionContext:
 
     @staticmethod
     def _resolve_color(label_lower: str) -> Tuple[int, int, int]:
+        if label_lower.startswith('speed-limit'):
+            return BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
         return BOX_COLOR_MAP.get(label_lower, DEFAULT_BOX_COLOR)
 
     def _classify_sign(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[Tuple[str, float]]:
@@ -348,6 +355,23 @@ class DetectionContext:
             confidence, predicted_idx = torch.max(probabilities, dim=1)
         label = RESNET_CLASS_NAMES[predicted_idx.item()]
         confidence_value = float(confidence.item())
+
+        use_ocr = 'maximum-speed-limit' in label or label == OTHER_SIGN_LABEL
+        ocr_result = None
+        if use_ocr and self._speed_limit_ocr is not None:
+            crop_rgb = frame_rgb[y1:y2, x1:x2]
+            ocr_result = self._speed_limit_ocr.infer(crop_rgb)
+        if ocr_result:
+            digits, ocr_score = ocr_result
+            label = f'speed-limit-{digits}'
+            confidence_value = ocr_score
+
+        if label.startswith('speed-limit-'):
+            if confidence_value < self.sign_conf_threshold:
+                return OTHER_SIGN_LABEL, confidence_value
+            self._update_sign_cache(bbox, label, confidence_value, timestamp)
+            return label, confidence_value
+
         if confidence_value < self.sign_conf_threshold:
             return OTHER_SIGN_LABEL, confidence_value
         self._update_sign_cache(bbox, label, confidence_value, timestamp)
@@ -398,6 +422,8 @@ class DetectionContext:
     def _format_sign_label(label: str) -> str:
         if label == OTHER_SIGN_LABEL:
             return 'Other Sign'
+        if label.startswith('speed-limit-'):
+            return f"Speed Limit {label.split('-', 2)[2].upper()}" if label.count('-') >= 2 else 'Speed Limit'
         parts = label.replace('--', ' ').replace('-', ' ').replace('_', ' ').split()
         return ' '.join(part.capitalize() for part in parts)
 

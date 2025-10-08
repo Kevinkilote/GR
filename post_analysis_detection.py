@@ -17,6 +17,7 @@ from PIL import Image
 from ultralytics import YOLO
 
 from tracker import IOUTracker
+from speed_limit_ocr import SpeedLimitOCR
 from traffic_sign_recognition import (
     DEFAULT_SIGN_LABELS,
     OTHER_SIGN_LABEL,
@@ -95,6 +96,7 @@ class VideoDetectionPipeline:
         self._display_ttl = max(0.05, display_ttl)
         self._sign_cache_ttl = max(0.1, sign_cache_ttl)
         self._sign_conf_threshold = max(0.0, sign_conf_threshold)
+        self._speed_limit_ocr = SpeedLimitOCR()
 
         self._last_timestamp = -float('inf')
         self._last_snapshot: Optional[DetectionSnapshot] = None
@@ -207,6 +209,9 @@ class VideoDetectionPipeline:
                     if sign_label == OTHER_SIGN_LABEL:
                         text = display_label
                         color = BOX_COLOR_MAP.get(OTHER_SIGN_LABEL, DEFAULT_BOX_COLOR)
+                    elif sign_label.startswith('speed-limit-'):
+                        text = f"{display_label} ({confidence:.2f})"
+                        color = BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
                     else:
                         text = f"{display_label} {confidence:.2f}"
                         color = BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
@@ -241,6 +246,22 @@ class VideoDetectionPipeline:
 
         label = RESNET_CLASS_NAMES[predicted_idx.item()]
         confidence_value = float(confidence.item())
+        use_ocr = 'maximum-speed-limit' in label or label == OTHER_SIGN_LABEL
+        ocr_result = None
+        if use_ocr and self._speed_limit_ocr is not None:
+            crop_rgb = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            ocr_result = self._speed_limit_ocr.infer(crop_rgb)
+        if ocr_result:
+            digits, ocr_score = ocr_result
+            label = f'speed-limit-{digits}'
+            confidence_value = ocr_score
+
+        if label.startswith('speed-limit-'):
+            if confidence_value < self._sign_conf_threshold:
+                return OTHER_SIGN_LABEL, confidence_value
+            self._update_sign_cache(bbox, label, confidence_value, timestamp)
+            return label, confidence_value
+
         if confidence_value < self._sign_conf_threshold:
             return OTHER_SIGN_LABEL, confidence_value
         self._update_sign_cache(bbox, label, confidence_value, timestamp)
@@ -303,6 +324,9 @@ class VideoDetectionPipeline:
     def _format_sign_label(label: str) -> str:
         if label == OTHER_SIGN_LABEL:
             return 'Other Sign'
+        if label.startswith('speed-limit-'):
+            suffix = label.split('-', 2)[2] if label.count('-') >= 2 else ''
+            return f"Speed Limit {suffix.upper()}" if suffix else 'Speed Limit'
         parts = label.replace('--', ' ').replace('-', ' ').replace('_', ' ').split()
         return ' '.join(part.capitalize() for part in parts)
 
