@@ -214,9 +214,9 @@ class VideoDetectionPipeline:
                     if sign_label == OTHER_SIGN_LABEL:
                         text = display_label
                         color = BOX_COLOR_MAP.get(OTHER_SIGN_LABEL, DEFAULT_BOX_COLOR)
-                    elif sign_label.startswith('speed-limit-'):
+                    elif sign_label == 'speed-limit' or sign_label.startswith('speed-limit-'):
                         text = f"{display_label} ({confidence:.2f})"
-                        color = BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
+                        color = BOX_COLOR_MAP.get('speed-limit', BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR))
                     else:
                         text = f"{display_label} {confidence:.2f}"
                         color = BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR)
@@ -251,21 +251,15 @@ class VideoDetectionPipeline:
 
         label = RESNET_CLASS_NAMES[predicted_idx.item()]
         confidence_value = float(confidence.item())
-        use_ocr = 'maximum-speed-limit' in label or label == OTHER_SIGN_LABEL
         ocr_result = None
-        if use_ocr and self._speed_limit_ocr is not None:
+        if 'maximum-speed-limit' in label or label == OTHER_SIGN_LABEL:
             crop_rgb = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-            ocr_result = self._speed_limit_ocr.infer(crop_rgb)
-        if ocr_result:
-            digits, ocr_score = ocr_result
-            label = f'speed-limit-{digits}'
-            confidence_value = ocr_score
-
-        if label.startswith('speed-limit-'):
-            if confidence_value < self._sign_conf_threshold:
-                return OTHER_SIGN_LABEL, confidence_value
-            self._update_sign_cache(bbox, label, confidence_value, timestamp)
-            return label, confidence_value
+            ocr = self._speed_limit_ocr.infer(crop_rgb)
+            if ocr is not None:
+                label = f"speed-limit-{ocr.value}"
+                confidence_value = min(confidence_value, ocr.score)
+            elif 'maximum-speed-limit' in label:
+                label = 'speed-limit'
 
         if confidence_value < self._sign_conf_threshold:
             return OTHER_SIGN_LABEL, confidence_value
@@ -329,9 +323,11 @@ class VideoDetectionPipeline:
     def _format_sign_label(label: str) -> str:
         if label == OTHER_SIGN_LABEL:
             return 'Other Sign'
+        if label == 'speed-limit':
+            return 'Speed Limit'
         if label.startswith('speed-limit-'):
-            suffix = label.split('-', 2)[2] if label.count('-') >= 2 else ''
-            return f"Speed Limit {suffix.upper()}" if suffix else 'Speed Limit'
+            suffix = label.split('-', 2)[2]
+            return f"Speed Limit {suffix}"
         parts = label.replace('--', ' ').replace('-', ' ').replace('_', ' ').split()
         return ' '.join(part.capitalize() for part in parts)
 

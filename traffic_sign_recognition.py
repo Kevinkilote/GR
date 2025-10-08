@@ -15,7 +15,7 @@ RESNET_CLASS_NAMES: Sequence[str] = (
     'information--tram-bus-stop--g2',
     'regulatory--go-straight--g1',
     'regulatory--keep-right--g1',
-    'regulatory--maximum-speed-limit-40--g1',
+    'regulatory--maximum-speed-limit--g1',
     'regulatory--no-entry--g1',
     'regulatory--no-left-turn--g1',
     'regulatory--no-parking--g1',

@@ -1,8 +1,8 @@
-"""Digit recognizer for speed-limit traffic signs."""
+"""Template-based OCR for circular speed-limit signs."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -15,104 +15,106 @@ class OCRResult:
 
 
 class SpeedLimitOCR:
-    """Template-based OCR tailored for circular speed limit signs."""
+    """Recognise the numeric value displayed on a circular speed limit sign."""
 
     def __init__(
         self,
-        candidate_digits: Iterable[int] = range(0, 10),
-        digit_size: Tuple[int, int] = (28, 42),
+        candidate_values: Sequence[int] = (
+            5,
+            10,
+            15,
+            20,
+            25,
+            30,
+            35,
+            40,
+            45,
+            50,
+            55,
+            60,
+            65,
+            70,
+            75,
+            80,
+            85,
+            90,
+            95,
+            100,
+            110,
+            120,
+            130,
+        ),
+        template_size: Tuple[int, int] = (140, 140),
         match_threshold: float = 0.35,
     ) -> None:
-        self.digit_size = digit_size
+        self.template_size = template_size
         self.match_threshold = match_threshold
         self.font = cv2.FONT_HERSHEY_SIMPLEX
-        self.font_scale = 1.5
-        self.thickness = 3
-        self.digit_templates = self._build_digit_templates(candidate_digits)
+        self.font_scale = 2.8
+        self.thickness = 6
+        self.templates: Dict[str, np.ndarray] = self._build_templates(candidate_values)
 
-    def infer(self, crop_rgb: np.ndarray) -> Optional[Tuple[str, float]]:
+    def infer(self, crop_rgb: np.ndarray) -> Optional[OCRResult]:
         if crop_rgb.size == 0:
             return None
 
         gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         h, w = gray.shape
-        if h < 24 or w < 24:
+        if h < 32 or w < 32:
             return None
 
-        # Emphasise the inner region of the sign (remove red border)
         mask = np.zeros_like(gray)
         radius = int(min(h, w) * 0.45)
         cv2.circle(mask, (w // 2, h // 2), radius, 255, -1)
-        inner = cv2.bitwise_and(gray, gray, mask=mask)
+        masked = cv2.bitwise_and(gray, gray, mask=mask)
 
-        # High-contrast threshold for digits (digits are dark)
-        _, thresh = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        thresh = cv2.medianBlur(thresh, 5)
-        thresh = cv2.dilate(thresh, np.ones((3, 3), np.uint8), iterations=1)
+        norm = cv2.normalize(masked, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+        _, binary = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        binary = cv2.medianBlur(binary, 5)
+        binary = cv2.dilate(binary, np.ones((3, 3), np.uint8), iterations=1)
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        digit_regions = []
-        for cnt in contours:
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            if cw <= 0 or ch <= 0:
-                continue
-            if ch < h * 0.35 or cw < w * 0.12:
-                continue
-            if ch > h * 0.95 or cw > w * 0.75:
-                continue
-            cx = x + cw / 2
-            if cx < w * 0.2 or cx > w * 0.8:
-                continue
-            region = thresh[y : y + ch, x : x + cw]
-            digit_regions.append((x, region))
-
-        if not digit_regions:
+        ys, xs = np.where(binary > 0)
+        if len(xs) == 0 or len(ys) == 0:
             return None
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+        pad_x = int((x2 - x1) * 0.1)
+        pad_y = int((y2 - y1) * 0.1)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+        digit_roi = binary[y1:y2, x1:x2]
+        if digit_roi.size == 0:
+            digit_roi = binary
 
-        digit_regions.sort(key=lambda item: item[0])
-        digits: list[str] = []
-        scores: list[float] = []
-        for _, region in digit_regions[:3]:
-            roi = self._prepare_digit(region)
-            digit, score = self._match_digit(roi)
-            if digit is None or score < self.match_threshold:
-                return None
-            digits.append(digit)
-            scores.append(score)
+        resized = cv2.resize(digit_roi, self.template_size, interpolation=cv2.INTER_AREA)
+        resized = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY)[1]
 
-        if not digits:
+        best_value = None
+        best_score = -1.0
+        for value, template in self.templates.items():
+            result = cv2.matchTemplate(resized, template, cv2.TM_CCOEFF_NORMED)
+            score = float(result[0][0])
+            if score > best_score:
+                best_score = score
+                best_value = value
+
+        if best_value is None or best_score < self.match_threshold:
             return None
-        value = ''.join(digits)
-        score = float(np.mean(scores)) if scores else 0.0
-        return value, score
+        return OCRResult(value=best_value, score=best_score)
 
-    def _prepare_digit(self, region: np.ndarray) -> np.ndarray:
-        region = cv2.resize(region, self.digit_size, interpolation=cv2.INTER_AREA)
-        region = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY)[1]
-        return region
-
-    def _build_digit_templates(self, candidate_digits: Iterable[int]) -> Dict[str, np.ndarray]:
+    def _build_templates(self, candidate_values: Iterable[int]) -> Dict[str, np.ndarray]:
         templates: Dict[str, np.ndarray] = {}
-        width, height = self.digit_size
-        for digit in candidate_digits:
+        width, height = self.template_size
+        for value in candidate_values:
+            text = str(value)
             canvas = np.zeros((height, width), dtype=np.uint8)
-            text = str(digit)
             text_size = cv2.getTextSize(text, self.font, self.font_scale, self.thickness)[0]
             text_x = max(0, (width - text_size[0]) // 2)
-            text_y = max(text_size[1] + (height - text_size[1]) // 2 - 4, text_size[1])
+            text_y = max(text_size[1] + (height - text_size[1]) // 2 - 6, text_size[1])
             cv2.putText(canvas, text, (text_x, text_y), self.font, self.font_scale, 255, self.thickness, cv2.LINE_AA)
             template = cv2.threshold(canvas, 0, 255, cv2.THRESH_BINARY)[1]
             templates[text] = template
         return templates
-
-    def _match_digit(self, roi: np.ndarray) -> Tuple[Optional[str], float]:
-        best_digit = None
-        best_score = -1.0
-        for digit, template in self.digit_templates.items():
-            result = cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED)
-            score = float(result[0][0])
-            if score > best_score:
-                best_digit = digit
-                best_score = score
-        return best_digit, best_score
