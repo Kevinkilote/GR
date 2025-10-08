@@ -74,6 +74,7 @@ class VideoDetectionPipeline:
         detection_interval: float,
         display_ttl: float,
         sign_cache_ttl: float,
+        skip_labels: Optional[Iterable[str]],
         sign_conf_threshold: float,
     ) -> None:
         if not os.path.exists(yolo_weights):
@@ -95,6 +96,7 @@ class VideoDetectionPipeline:
         self._detection_interval = max(0.0, detection_interval)
         self._display_ttl = max(0.05, display_ttl)
         self._sign_cache_ttl = max(0.1, sign_cache_ttl)
+        self._skip_labels = {label.lower() for label in (skip_labels or [])}
         self._sign_conf_threshold = max(0.0, sign_conf_threshold)
         self._speed_limit_ocr = SpeedLimitOCR()
 
@@ -198,6 +200,8 @@ class VideoDetectionPipeline:
 
             raw_label = self._names.get(int(cls_idx), f'class_{cls_idx}')
             label_lower = raw_label.lower()
+            if label_lower in self._skip_labels:
+                continue
             text = f"{raw_label} {score:.2f}"
             color = BOX_COLOR_MAP.get(label_lower, DEFAULT_BOX_COLOR)
 
@@ -344,6 +348,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--detection-interval', default=0.02, type=float, help='minimum seconds between consecutive YOLO runs (default: 0.02)')
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep detections visible without refresh (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet predictions (default: 0.75)')
+    parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
     parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
     parser.add_argument('--no-display', action='store_true', help='disable on-screen display (useful for batch processing)')
     parser.add_argument('--debug', action='store_true', help='enable verbose logging')
@@ -376,6 +381,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         None if args.sign_labels is None else args.sign_labels.split(',')
     )
     resnet_path = None if args.resnet.lower() == 'none' else args.resnet
+    skip_labels = {label.strip().lower() for label in args.skip_labels.split(',') if label.strip()} if args.skip_labels else set()
 
     sign_conf_threshold = max(0.0, args.sign_conf_threshold)
 
@@ -390,6 +396,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         display_ttl=args.display_ttl,
         sign_cache_ttl=args.sign_cache_ttl,
         sign_conf_threshold=sign_conf_threshold,
+        skip_labels=skip_labels,
     )
 
     cap = cv2.VideoCapture(video_path)

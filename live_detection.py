@@ -82,6 +82,7 @@ class DetectionContext:
         display_ttl: float = 0.3,
         sign_cache_ttl: float = 0.75,
         sign_confidence_threshold: float = 0.6,
+        skip_labels: Optional[Set[str]] = None,
     ) -> None:
         self.weights_path = weights_path
         self.confidence = conf
@@ -104,6 +105,7 @@ class DetectionContext:
         self._class_map: Optional[Dict[int, str]] = None
         self._resnet_path = resnet_path
         self._sign_labels = {label.lower() for label in (sign_labels or set())}
+        self._skip_labels = {label.lower() for label in (skip_labels or set())}
         self._resnet_model = None
         self._resnet_transform = None
         self._torch_device: Optional[torch.device] = None
@@ -312,6 +314,8 @@ class DetectionContext:
                 continue
             raw_label = class_map.get(int(cls_idx), f'class_{cls_idx}')
             label_lower = raw_label.lower()
+            if label_lower in self._skip_labels:
+                continue
             text = f"{raw_label} {score:.2f}"
             color = self._resolve_color(label_lower)
             if label_lower in self._sign_labels and self._resnet_model is not None and self._resnet_transform is not None:
@@ -681,6 +685,7 @@ def game_loop(args):
         display_ttl=args.display_ttl,
         sign_cache_ttl=args.sign_cache_ttl,
         sign_confidence_threshold=args.sign_conf_threshold,
+        skip_labels=args.skip_labels,
     )
     try:
         client = base.carla.Client(args.host, args.port)
@@ -724,6 +729,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep last detections on screen (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
     parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
+    parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
     parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     args = parser.parse_args()
@@ -736,6 +742,7 @@ def parse_args() -> argparse.Namespace:
     args.display_ttl = max(0.05, args.display_ttl)
     args.sign_cache_ttl = max(0.1, args.sign_cache_ttl)
     args.sign_conf_threshold = max(0.0, args.sign_conf_threshold)
+    args.skip_labels = {label.strip().lower() for label in args.skip_labels.split(',') if label.strip()} if args.skip_labels else set()
     return args
 
 
