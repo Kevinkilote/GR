@@ -408,6 +408,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_idx = 0
     paused = False
+    seek_offset = 0
 
     logging.info('Processing video %s (fps=%.2f)', video_path, fps)
 
@@ -436,6 +437,22 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 break
             if key == ord(' '):
                 paused = not paused
+            if key == ord('s'):
+                paused = True
+            if key in (ord('f'), 255):
+                seek_offset = 10
+            elif key in (ord('b'), 254):
+                seek_offset = -10
+            elif key == 83:  # Right arrow in OpenCV's waitKey
+                seek_offset = 10
+            elif key == 81:  # Left arrow
+                seek_offset = -10
+            else:
+                seek_offset = 0
+
+            if seek_offset != 0:
+                frame_idx = max(0, frame_idx + seek_offset)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             if key == ord('s'):
                 paused = True
     finally:
