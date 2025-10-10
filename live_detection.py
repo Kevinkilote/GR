@@ -447,6 +447,26 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._surface_size: Optional[Tuple[int, int]] = None
         self._label_cache: Dict[str, pygame.Surface] = {}
         self._tracker = IOUTracker(max_ttl=15, min_streak=1, iou_threshold=0.3)
+        interior_view = base.carla.Transform(
+            base.carla.Location(x=0.5, y=0.0, z=1.2),
+            base.carla.Rotation(pitch=0.0),
+        )
+        hood_view = base.carla.Transform(
+            base.carla.Location(x=1.6, z=1.7),
+            base.carla.Rotation(pitch=0.0),
+        )
+        chase_view = base.carla.Transform(
+            base.carla.Location(x=-5.5, z=2.8),
+            base.carla.Rotation(pitch=-15),
+        )
+        existing_transforms = list(getattr(self, '_camera_transforms', []))
+        desired_order = [interior_view, hood_view, chase_view]
+        merged: List[base.carla.Transform] = []
+        for transform in desired_order + existing_transforms:
+            if not any(self._transforms_equal(transform, current) for current in merged):
+                merged.append(transform)
+        self._camera_transforms = merged
+        self.transform_index = 0
 
     def set_sensor(self, index, notify=True):  # noqa: D401 (interface inherited)
         index = index % len(self.sensors)
@@ -560,6 +580,19 @@ class LiveDetectionCameraManager(base.CameraManager):
             self._label_cache[label] = label_surface
             cached = label_surface
         return cached.copy()
+
+    @staticmethod
+    def _transforms_equal(a: 'base.carla.Transform', b: 'base.carla.Transform', tol: float = 1e-3) -> bool:
+        loc_a, loc_b = a.location, b.location
+        rot_a, rot_b = a.rotation, b.rotation
+        return (
+            abs(loc_a.x - loc_b.x) <= tol
+            and abs(loc_a.y - loc_b.y) <= tol
+            and abs(loc_a.z - loc_b.z) <= tol
+            and abs(rot_a.pitch - rot_b.pitch) <= tol
+            and abs(rot_a.roll - rot_b.roll) <= tol
+            and abs(rot_a.yaw - rot_b.yaw) <= tol
+        )
 
 
 class LiveDetectionWorld(base.World):
