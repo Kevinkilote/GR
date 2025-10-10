@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import queue
 import threading
@@ -438,9 +439,10 @@ class LiveDetectionCameraManager(base.CameraManager):
     BG_COLOR = (20, 20, 20)
     LABEL_CACHE_MAX = 64
 
-    def __init__(self, parent_actor, hud, detection: DetectionContext):
+    def __init__(self, parent_actor, hud, detection: DetectionContext, frame_interval: Optional[float] = None):
         super().__init__(parent_actor, hud)
         self._detection = detection
+        self._frame_interval = frame_interval if frame_interval and frame_interval > 0 else None
         self._label_font = pygame.font.Font(pygame.font.get_default_font(), 18)
         self._surface_size: Optional[Tuple[int, int]] = None
         self._label_cache: Dict[str, pygame.Surface] = {}
@@ -453,8 +455,11 @@ class LiveDetectionCameraManager(base.CameraManager):
             if self.sensor is not None:
                 self.sensor.destroy()
                 self.surface = None
+            blueprint = self.sensors[index][-1]
+            if self._frame_interval and blueprint.has_attribute('sensor_tick'):
+                blueprint.set_attribute('sensor_tick', f'{self._frame_interval:.6f}')
             self.sensor = self._parent.get_world().spawn_actor(
-                self.sensors[index][-1],
+                blueprint,
                 self._camera_transforms[self.transform_index],
                 attach_to=self._parent,
             )
@@ -560,8 +565,13 @@ class LiveDetectionCameraManager(base.CameraManager):
 class LiveDetectionWorld(base.World):
     """World wrapper that swaps in a detection-aware camera manager."""
 
-    def __init__(self, carla_world, hud, actor_filter, detection: DetectionContext):
+    def __init__(self, carla_world, hud, actor_filter, detection: DetectionContext, sim_fps: Optional[float]):
         self._detection = detection
+        self._sim_fps = sim_fps if sim_fps and sim_fps > 0 else None
+        self._original_settings = carla_world.get_settings()
+        self._sync_mode_enabled = False
+        if self._sim_fps:
+            self._enable_sync_mode(carla_world, self._sim_fps)
         super().__init__(carla_world, hud, actor_filter)
 
     def restart(self):
@@ -578,9 +588,37 @@ class LiveDetectionWorld(base.World):
             if previous_manager.sensor is not None:
                 previous_manager.sensor.stop()
                 previous_manager.sensor.destroy()
-        self.camera_manager = LiveDetectionCameraManager(self.player, self.hud, self._detection)
+        frame_interval = (1.0 / self._sim_fps) if self._sim_fps else None
+        self.camera_manager = LiveDetectionCameraManager(self.player, self.hud, self._detection, frame_interval)
         self.camera_manager.transform_index = transform_index
         self.camera_manager.set_sensor(sensor_index, notify=False)
+
+    def _enable_sync_mode(self, carla_world, sim_fps: float) -> None:
+        settings = carla_world.get_settings()
+        target_delta = 1.0 / sim_fps
+        current_delta = settings.fixed_delta_seconds or 0.0
+        needs_update = (
+            not settings.synchronous_mode
+            or not math.isclose(current_delta, target_delta, rel_tol=1e-3)
+        )
+        if needs_update:
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = target_delta
+            carla_world.apply_settings(settings)
+        self._sync_mode_enabled = True
+
+    def destroy(self):
+        try:
+            super().destroy()
+        finally:
+            if self._sync_mode_enabled:
+                self.world.apply_settings(self._original_settings)
+                self._sync_mode_enabled = False
+
+    def tick(self, clock):
+        if self._sync_mode_enabled:
+            self.world.tick()
+        super().tick(clock)
 
 
 class LiveDualControl(base.DualControl):
@@ -693,11 +731,15 @@ def game_loop(args):
             pygame.HWSURFACE | pygame.DOUBLEBUF,
         )
         hud = base.HUD(args.width, args.height)
-        world = LiveDetectionWorld(client.get_world(), hud, args.filter, detection_context)
+        world = LiveDetectionWorld(client.get_world(), hud, args.filter, detection_context, args.sim_fps)
         controller = LiveDualControl(world, args.autopilot, detection_context, args.detect_button)
         clock = pygame.time.Clock()
+        target_fps = int(round(args.sim_fps)) if args.sim_fps > 0 else 0
         while True:
-            clock.tick_busy_loop(60)
+            if target_fps > 0:
+                clock.tick_busy_loop(target_fps)
+            else:
+                clock.tick_busy_loop(0)
             if controller.parse_events(world, clock):
                 return
             world.tick(clock)
@@ -728,6 +770,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
     parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
     parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
+    parser.add_argument('--sim-fps', default=30.0, type=float, help='target simulation FPS for 1:1 playback (set to 0 to disable throttling)')
     parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     args = parser.parse_args()
@@ -736,6 +779,7 @@ def parse_args() -> argparse.Namespace:
         args.detect_button = None
     if args.resnet and args.resnet.strip().lower() == 'none':
         args.resnet = None
+    args.sim_fps = max(0.0, float(args.sim_fps))
     args.sign_labels = parse_sign_labels_arg(args.sign_labels)
     args.display_ttl = max(0.05, args.display_ttl)
     args.sign_cache_ttl = max(0.1, args.sign_cache_ttl)
