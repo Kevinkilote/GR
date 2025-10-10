@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -406,15 +407,20 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         writer = create_writer(cap, args.output)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_duration = 1.0 / fps if fps > 0 else 0.0
+    playback_delay_ms = max(1, int(round(frame_duration * 1000))) if frame_duration > 0 else 1
+    next_frame_deadline = time.perf_counter()
     frame_idx = 0
     paused = False
     seek_offset = 0
+    was_paused = paused
 
     logging.info('Processing video %s (fps=%.2f)', video_path, fps)
 
     try:
         while True:
             if not paused:
+                frame_start = time.perf_counter()
                 ret, frame = cap.read()
                 if not ret:
                     logging.info('End of video reached')
@@ -430,8 +436,19 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     cv2.imshow('CARLA Post Analysis', overlay)
 
                 frame_idx += 1
+                if not args.no_display and frame_duration > 0:
+                    next_frame_deadline = max(next_frame_deadline + frame_duration, frame_start + frame_duration)
+                    sleep_time = next_frame_deadline - time.perf_counter()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    else:
+                        next_frame_deadline = time.perf_counter()
 
-            key = cv2.waitKey(1 if not args.no_display else 0) & 0xFF
+            if args.no_display:
+                key = -1
+            else:
+                key_delay = 0 if paused else playback_delay_ms
+                key = cv2.waitKey(key_delay) & 0xFF
             if key == ord('q'):
                 logging.info('User requested exit')
                 break
@@ -453,8 +470,13 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             if seek_offset != 0:
                 frame_idx = max(0, frame_idx + seek_offset)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                if not args.no_display:
+                    next_frame_deadline = time.perf_counter()
             if key == ord('s'):
                 paused = True
+            if was_paused and not paused and not args.no_display:
+                next_frame_deadline = time.perf_counter()
+            was_paused = paused
     finally:
         cap.release()
         if writer is not None:
