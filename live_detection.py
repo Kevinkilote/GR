@@ -491,6 +491,8 @@ class LiveDetectionCameraManager(base.CameraManager):
         self = weak_self()
         if not self:
             return
+        if self.index is None or self.index >= len(self.sensors):
+            return
         sensor_id = self.sensors[self.index][0]
         if sensor_id.startswith('sensor.lidar'):
             points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
