@@ -362,12 +362,16 @@ class DetectionContext:
         confidence_value = float(confidence.item())
 
         ocr_result = None
-        if 'maximum-speed-limit' in label or label == OTHER_SIGN_LABEL:
+        if (
+            'maximum-speed-limit' in label
+            or label == OTHER_SIGN_LABEL
+            or label.startswith('speed-limit')
+        ):
             crop_rgb = frame_rgb[y1:y2, x1:x2]
             ocr_result = self._speed_limit_ocr.infer(crop_rgb)
             if ocr_result is not None:
                 label = f"speed-limit-{ocr_result.value}"
-                confidence_value = min(confidence_value, ocr_result.score)
+                confidence_value = float((confidence_value + ocr_result.score) / 2.0)
             elif 'maximum-speed-limit' in label:
                 label = 'speed-limit'
 
