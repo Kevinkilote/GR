@@ -50,6 +50,35 @@ class SignCacheEntry:
     timestamp: float
 
 
+class PlaybackClock:
+    """Keeps display playback aligned with the source frame rate."""
+
+    def __init__(self, fps: float) -> None:
+        self.frame_duration = 1.0 / fps if fps > 0 else 0.0
+        self._next_frame_time: Optional[float] = None
+
+    def mark_frame_start(self) -> None:
+        if self.frame_duration <= 0:
+            return
+        now = time.perf_counter()
+        if self._next_frame_time is None:
+            self._next_frame_time = now + self.frame_duration
+
+    def frame_delay(self) -> Tuple[int, float]:
+        if self.frame_duration <= 0 or self._next_frame_time is None:
+            return 1, 0.0
+        now = time.perf_counter()
+        remaining = self._next_frame_time - now
+        self._next_frame_time += self.frame_duration
+        if remaining <= 0:
+            return 1, 0.0
+        delay_ms = max(1, int(round(remaining * 1000)))
+        return delay_ms, remaining
+
+    def reset(self) -> None:
+        self._next_frame_time = None
+
+
 BOX_COLOR_MAP = {
     'traffic sign': (0, 255, 0),      # green
     'traffic light': (0, 255, 255),   # yellow
@@ -407,55 +436,54 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         writer = create_writer(cap, args.output)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_duration = 1.0 / fps if fps > 0 else 0.0
-    playback_delay_ms = max(1, int(round(frame_duration * 1000))) if frame_duration > 0 else 1
-    next_frame_deadline = time.perf_counter()
+    playback_clock = PlaybackClock(fps)
     frame_idx = 0
     paused = False
     seek_offset = 0
-    was_paused = paused
 
     logging.info('Processing video %s (fps=%.2f)', video_path, fps)
 
     try:
         while True:
+            key_delay_ms = 1
+            sleep_seconds = 0.0
             if not paused:
-                frame_start = time.perf_counter()
+                playback_clock.mark_frame_start()
                 ret, frame = cap.read()
                 if not ret:
                     logging.info('End of video reached')
                     break
-                timestamp = frame_idx / fps
+                timestamp = frame_idx / fps if fps > 0 else 0.0
                 annotated, detections = pipeline.process_frame(frame, timestamp)
 
                 if writer is not None:
                     writer.write(annotated)
 
                 if not args.no_display:
-                    overlay = _compose_overlay(annotated, detections, timestamp)
-                    cv2.imshow('CARLA Post Analysis', overlay)
+                    display_frame = _compose_overlay(annotated, detections, timestamp)
+                    cv2.imshow('CARLA Post Analysis', display_frame)
 
                 frame_idx += 1
-                if not args.no_display and frame_duration > 0:
-                    next_frame_deadline = max(next_frame_deadline + frame_duration, frame_start + frame_duration)
-                    sleep_time = next_frame_deadline - time.perf_counter()
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    else:
-                        next_frame_deadline = time.perf_counter()
+                key_delay_ms, sleep_seconds = playback_clock.frame_delay()
+            else:
+                playback_clock.reset()
 
             if args.no_display:
+                if not paused and sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
                 key = -1
             else:
-                key_delay = 0 if paused else playback_delay_ms
-                key = cv2.waitKey(key_delay) & 0xFF
+                wait_arg = 0 if paused else key_delay_ms
+                key = cv2.waitKey(wait_arg) & 0xFF
             if key == ord('q'):
                 logging.info('User requested exit')
                 break
             if key == ord(' '):
                 paused = not paused
+                playback_clock.reset()
             if key == ord('s'):
                 paused = True
+                playback_clock.reset()
             if key in (ord('f'), 255):
                 seek_offset = 10
             elif key in (ord('b'), 254):
@@ -470,13 +498,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             if seek_offset != 0:
                 frame_idx = max(0, frame_idx + seek_offset)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                if not args.no_display:
-                    next_frame_deadline = time.perf_counter()
-            if key == ord('s'):
-                paused = True
-            if was_paused and not paused and not args.no_display:
-                next_frame_deadline = time.perf_counter()
-            was_paused = paused
+                playback_clock.reset()
     finally:
         cap.release()
         if writer is not None:
@@ -489,8 +511,9 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 def _compose_overlay(frame: np.ndarray, detections: Sequence[DetectionItem], timestamp: float) -> np.ndarray:
     overlay = frame.copy()
     text = f"Frame time: {timestamp:06.2f}s | Detections: {len(detections)}"
-    cv2.rectangle(overlay, (10, 10), (10 + 320, 40), (0, 0, 0), -1)
-    cv2.putText(overlay, text, (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    origin = (20, 32)
+    cv2.putText(overlay, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(overlay, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     return overlay
 
 
