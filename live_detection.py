@@ -585,22 +585,30 @@ class LiveDetectionWorld(base.World):
         super().__init__(carla_world, hud, actor_filter)
 
     def restart(self):
-        super().restart()
-        self._attach_detection_camera()
-
-    def _attach_detection_camera(self) -> None:
         previous_manager = getattr(self, 'camera_manager', None)
-        transform_index = 0
-        sensor_index = 0
+        prev_transform_index = previous_manager.transform_index if previous_manager and previous_manager.transform_index is not None else 0
+        prev_sensor_index = previous_manager.index if previous_manager and previous_manager.index is not None else 0
         if previous_manager is not None:
-            transform_index = previous_manager.transform_index
-            sensor_index = previous_manager.index or 0
+            previous_manager.transform_index = min(prev_transform_index, 1)
+        super().restart()
+        self._attach_detection_camera(prev_transform_index, prev_sensor_index)
+
+    def _attach_detection_camera(self, transform_index_override: Optional[int] = None, sensor_index_override: Optional[int] = None) -> None:
+        previous_manager = getattr(self, 'camera_manager', None)
+        transform_index = transform_index_override if transform_index_override is not None else 0
+        sensor_index = sensor_index_override if sensor_index_override is not None else 0
+        if previous_manager is not None:
+            if transform_index_override is None and previous_manager.transform_index is not None:
+                transform_index = previous_manager.transform_index
+            if sensor_index_override is None and previous_manager.index is not None:
+                sensor_index = previous_manager.index
             if previous_manager.sensor is not None:
                 previous_manager.sensor.stop()
                 previous_manager.sensor.destroy()
         frame_interval = (1.0 / self._sim_fps) if self._sim_fps else None
         self.camera_manager = LiveDetectionCameraManager(self.player, self.hud, self._detection, frame_interval)
-        self.camera_manager.transform_index = transform_index
+        max_transform = max(1, len(self.camera_manager._camera_transforms))
+        self.camera_manager.transform_index = transform_index % max_transform
         self.camera_manager.set_sensor(sensor_index, notify=False)
 
     def _enable_sync_mode(self, carla_world, sim_fps: float) -> None:
