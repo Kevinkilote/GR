@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import re
 import os
 import queue
 import threading
@@ -359,6 +360,7 @@ class DetectionContext:
             probabilities = F.softmax(output, dim=1)
             confidence, predicted_idx = torch.max(probabilities, dim=1)
         label = RESNET_CLASS_NAMES[predicted_idx.item()]
+        original_label = label
         confidence_value = float(confidence.item())
 
         ocr_result = None
@@ -372,8 +374,12 @@ class DetectionContext:
             if ocr_result is not None:
                 label = f"speed-limit-{ocr_result.value}"
                 confidence_value = float((confidence_value + ocr_result.score) / 2.0)
-            elif 'maximum-speed-limit' in label:
-                label = 'speed-limit'
+            else:
+                extracted = self._extract_speed_value(original_label)
+                if extracted is not None:
+                    label = f"speed-limit-{extracted}"
+                elif 'maximum-speed-limit' in label and not label.startswith('speed-limit-'):
+                    label = 'speed-limit'
 
         if confidence_value < self.sign_conf_threshold:
             return OTHER_SIGN_LABEL, confidence_value
@@ -432,6 +438,13 @@ class DetectionContext:
             return f"Speed Limit {suffix}"
         parts = label.replace('--', ' ').replace('-', ' ').replace('_', ' ').split()
         return ' '.join(part.capitalize() for part in parts)
+
+    @staticmethod
+    def _extract_speed_value(label: str) -> Optional[str]:
+        matches = re.findall(r'\d{1,3}', label)
+        if not matches:
+            return None
+        return matches[0]
 
 
 
