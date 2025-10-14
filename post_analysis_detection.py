@@ -57,33 +57,41 @@ class PlaybackClock:
         self._fps = fps if fps > 0 else 0.0
         self._speed = max(1e-6, speed)
         self._frame_duration = (1.0 / self._fps) / self._speed if self._fps > 0 else 0.0
-        self._start_time: Optional[float] = None
-        self._frames_rendered = 0
+        self._anchor_video_time: Optional[float] = None
+        self._anchor_wall_time: Optional[float] = None
+        self._prev_video_time: Optional[float] = None
+        self._last_interval: Optional[float] = self._frame_duration if self._frame_duration > 0 else None
 
-    def wait_for_frame(self) -> None:
-        if self._frame_duration <= 0:
+    def align(self, video_timestamp: float) -> None:
+        if self._anchor_video_time is None or self._anchor_wall_time is None:
+            self._anchor_video_time = video_timestamp
+            self._anchor_wall_time = time.perf_counter()
+            self._prev_video_time = video_timestamp
             return
+        target_time = self._anchor_wall_time + (video_timestamp - self._anchor_video_time) / self._speed
         now = time.perf_counter()
-        if self._start_time is None:
-            self._start_time = now
-            return
-        target_time = self._start_time + self._frames_rendered * self._frame_duration
-        if now < target_time:
-            time.sleep(target_time - now)
-
-    def frame_rendered(self) -> None:
-        if self._frame_duration <= 0:
-            return
-        self._frames_rendered += 1
+        remaining = target_time - now
+        if remaining > 0:
+            time.sleep(remaining)
+        if self._prev_video_time is not None:
+            video_interval = max(0.0, video_timestamp - self._prev_video_time)
+            if video_interval > 0:
+                self._last_interval = video_interval / self._speed
+        self._prev_video_time = video_timestamp
 
     def key_delay_ms(self, paused: bool) -> int:
-        if paused or self._frame_duration <= 0:
+        if paused:
             return 0
-        return max(1, int(round(self._frame_duration * 1000)))
+        interval = self._last_interval or self._frame_duration
+        if interval and interval > 0:
+            return max(1, int(round(interval * 1000)))
+        return 1
 
     def reset(self) -> None:
-        self._start_time = None
-        self._frames_rendered = 0
+        self._anchor_video_time = None
+        self._anchor_wall_time = None
+        self._prev_video_time = None
+        self._last_interval = self._frame_duration if self._frame_duration > 0 else None
 
 
 BOX_COLOR_MAP = {
@@ -457,15 +465,19 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     try:
         while True:
             if not paused:
-                if was_paused:
-                    playback_clock.reset()
-                    was_paused = False
-                playback_clock.wait_for_frame()
                 ret, frame = cap.read()
                 if not ret:
                     logging.info('End of video reached')
                     break
-                timestamp = frame_idx / fps if fps > 0 else 0.0
+                timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if timestamp_ms and timestamp_ms >= 0:
+                    timestamp = timestamp_ms / 1000.0
+                else:
+                    timestamp = frame_idx / fps if fps > 0 else 0.0
+                if was_paused:
+                    playback_clock.reset()
+                    was_paused = False
+                playback_clock.align(timestamp)
                 annotated, detections = pipeline.process_frame(frame, timestamp)
 
                 if writer is not None:
@@ -476,7 +488,6 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     cv2.imshow('CARLA Post Analysis', display_frame)
 
                 frame_idx += 1
-                playback_clock.frame_rendered()
             else:
                 if not was_paused:
                     playback_clock.reset()
@@ -495,9 +506,11 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
             if key == ord(' '):
                 paused = not paused
                 playback_clock.reset()
+                was_paused = True
             if key == ord('s'):
                 paused = True
                 playback_clock.reset()
+                was_paused = True
             if key in (ord('f'), 255):
                 seek_offset = 10
             elif key in (ord('b'), 254):
