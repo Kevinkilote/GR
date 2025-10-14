@@ -51,32 +51,39 @@ class SignCacheEntry:
 
 
 class PlaybackClock:
-    """Keeps display playback aligned with the source frame rate."""
+    """Keeps playback aligned with the source frame rate (optionally scaled)."""
 
-    def __init__(self, fps: float) -> None:
-        self.frame_duration = 1.0 / fps if fps > 0 else 0.0
-        self._next_frame_time: Optional[float] = None
+    def __init__(self, fps: float, speed: float = 1.0) -> None:
+        self._fps = fps if fps > 0 else 0.0
+        self._speed = max(1e-6, speed)
+        self._frame_duration = (1.0 / self._fps) / self._speed if self._fps > 0 else 0.0
+        self._start_time: Optional[float] = None
+        self._frames_rendered = 0
 
-    def mark_frame_start(self) -> None:
-        if self.frame_duration <= 0:
+    def wait_for_frame(self) -> None:
+        if self._frame_duration <= 0:
             return
         now = time.perf_counter()
-        if self._next_frame_time is None:
-            self._next_frame_time = now + self.frame_duration
+        if self._start_time is None:
+            self._start_time = now
+            return
+        target_time = self._start_time + self._frames_rendered * self._frame_duration
+        if now < target_time:
+            time.sleep(target_time - now)
 
-    def frame_delay(self) -> Tuple[int, float]:
-        if self.frame_duration <= 0 or self._next_frame_time is None:
-            return 1, 0.0
-        now = time.perf_counter()
-        remaining = self._next_frame_time - now
-        self._next_frame_time += self.frame_duration
-        if remaining <= 0:
-            return 1, 0.0
-        delay_ms = max(1, int(round(remaining * 1000)))
-        return delay_ms, remaining
+    def frame_rendered(self) -> None:
+        if self._frame_duration <= 0:
+            return
+        self._frames_rendered += 1
+
+    def key_delay_ms(self, paused: bool) -> int:
+        if paused or self._frame_duration <= 0:
+            return 0
+        return max(1, int(round(self._frame_duration * 1000)))
 
     def reset(self) -> None:
-        self._next_frame_time = None
+        self._start_time = None
+        self._frames_rendered = 0
 
 
 BOX_COLOR_MAP = {
@@ -377,6 +384,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet predictions (default: 0.75)')
     parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
     parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
+    parser.add_argument('--playback-speed', default=1.0, type=float, help='playback speed multiplier (1.0 keeps real-time pace)')
     parser.add_argument('--no-display', action='store_true', help='disable on-screen display (useful for batch processing)')
     parser.add_argument('--debug', action='store_true', help='enable verbose logging')
     return parser.parse_args(argv)
@@ -395,6 +403,8 @@ def create_writer(cap: cv2.VideoCapture, output_path: str) -> cv2.VideoWriter:
 
 def run(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+
+    args.playback_speed = max(1e-3, float(args.playback_speed))
 
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(format='%(levelname)s: %(message)s', level=log_level)
@@ -436,19 +446,21 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         writer = create_writer(cap, args.output)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    playback_clock = PlaybackClock(fps)
+    playback_clock = PlaybackClock(fps, args.playback_speed)
     frame_idx = 0
     paused = False
     seek_offset = 0
+    was_paused = True
 
     logging.info('Processing video %s (fps=%.2f)', video_path, fps)
 
     try:
         while True:
-            key_delay_ms = 1
-            sleep_seconds = 0.0
             if not paused:
-                playback_clock.mark_frame_start()
+                if was_paused:
+                    playback_clock.reset()
+                    was_paused = False
+                playback_clock.wait_for_frame()
                 ret, frame = cap.read()
                 if not ret:
                     logging.info('End of video reached')
@@ -464,17 +476,19 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                     cv2.imshow('CARLA Post Analysis', display_frame)
 
                 frame_idx += 1
-                key_delay_ms, sleep_seconds = playback_clock.frame_delay()
+                playback_clock.frame_rendered()
             else:
-                playback_clock.reset()
+                if not was_paused:
+                    playback_clock.reset()
+                    was_paused = True
 
+            key_delay_ms = playback_clock.key_delay_ms(paused)
             if args.no_display:
-                if not paused and sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
+                if paused:
+                    time.sleep(0.05)
                 key = -1
             else:
-                wait_arg = 0 if paused else key_delay_ms
-                key = cv2.waitKey(wait_arg) & 0xFF
+                key = cv2.waitKey(key_delay_ms) & 0xFF
             if key == ord('q'):
                 logging.info('User requested exit')
                 break
@@ -499,6 +513,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
                 frame_idx = max(0, frame_idx + seek_offset)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 playback_clock.reset()
+                was_paused = True
     finally:
         cap.release()
         if writer is not None:
