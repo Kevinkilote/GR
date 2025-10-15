@@ -69,6 +69,11 @@ class SpeedLimitOCR:
             numeric = str(int(value_str))
         except ValueError:
             return None
+        if numeric not in {
+            '5', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55', '60',
+            '65', '70', '75', '80', '85', '90', '95', '100', '110', '120', '130'
+        }:
+            return None
         confidence = float(np.mean([score for _digit, score in digits]))
         return OCRResult(value=numeric, score=confidence)
 

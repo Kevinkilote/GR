@@ -36,6 +36,10 @@ BOX_COLOR_MAP: Dict[str, Tuple[int, int, int]] = {
     OTHER_SIGN_LABEL: (160, 160, 160),
 }
 DEFAULT_BOX_COLOR: Tuple[int, int, int] = (255, 255, 255)
+SPEED_LIMIT_VALUES: Set[str] = {
+    '5', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55', '60',
+    '65', '70', '75', '80', '85', '90', '95', '100', '110', '120', '130'
+}
 
 
 def parse_sign_labels_arg(raw: Optional[str]) -> Set[str]:
@@ -53,6 +57,9 @@ class DetectionItem:
     bbox: Tuple[int, int, int, int]
     text: str
     color: Tuple[int, int, int]
+    label: str
+    confidence: float
+    source_label: str
 
 
 @dataclass(frozen=True)
@@ -318,23 +325,30 @@ class DetectionContext:
             label_lower = raw_label.lower()
             if label_lower in self._skip_labels:
                 continue
-            text = f"{raw_label} {score:.2f}"
             color = self._resolve_color(label_lower)
+            display_label = raw_label
+            display_confidence = float(score)
             if label_lower in self._sign_labels and self._resnet_model is not None and self._resnet_transform is not None:
                 classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2), timestamp)
                 if classified is not None:
                     sign_label, confidence = classified
                     display_label = self._format_sign_label(sign_label)
                     if sign_label == OTHER_SIGN_LABEL:
-                        text = display_label
                         color = self._resolve_color(OTHER_SIGN_LABEL)
                     elif sign_label == 'speed-limit' or sign_label.startswith('speed-limit-'):
-                        text = f"{display_label} ({confidence:.2f})"
                         color = self._resolve_color('speed-limit')
                     else:
-                        text = f"{display_label} {confidence:.2f}"
                         color = self._resolve_color('traffic sign')
-            items.append(DetectionItem(bbox=(x1, y1, x2, y2), text=text, color=color))
+                    display_confidence = confidence
+            text = f"{display_label} ({display_confidence:.2f})"
+            items.append(DetectionItem(
+                bbox=(x1, y1, x2, y2),
+                text=text,
+                color=color,
+                label=display_label,
+                confidence=display_confidence,
+                source_label=raw_label,
+            ))
         return tuple(items)
 
     @staticmethod
@@ -441,10 +455,25 @@ class DetectionContext:
 
     @staticmethod
     def _extract_speed_value(label: str) -> Optional[str]:
-        matches = re.findall(r'\d{1,3}', label)
-        if not matches:
-            return None
-        return matches[0]
+        label_lower = label.lower()
+        specific_match = re.search(r'(?:speed[-_]?limit[-_]?)(\d{1,3})', label_lower)
+        if specific_match:
+            return specific_match.group(1)
+        max_match = re.search(r'(?:maximum[-_]?speed[-_]?limit[-_]?)(\d{1,3})', label_lower)
+        if max_match:
+            return max_match.group(1)
+        for match in re.finditer(r'\d{1,3}', label_lower):
+            digits = match.group()
+            if digits in SPEED_LIMIT_VALUES:
+                return digits
+            if len(digits) >= 2 and digits.lstrip('0') in SPEED_LIMIT_VALUES:
+                return digits.lstrip('0')
+            start = match.start()
+            if start > 0 and label_lower[start - 1] == 'g':
+                continue
+            if len(digits) >= 2:
+                return digits
+        return None
 
 
 
@@ -459,8 +488,12 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._detection = detection
         self._frame_interval = frame_interval if frame_interval and frame_interval > 0 else None
         self._label_font = pygame.font.Font(pygame.font.get_default_font(), 18)
+        self._priority_font = pygame.font.Font(pygame.font.get_default_font(), 24)
         self._surface_size: Optional[Tuple[int, int]] = None
         self._label_cache: Dict[Tuple[str, Tuple[int, int, int]], pygame.Surface] = {}
+        self._priority_label: Optional[str] = None
+        self._priority_score: float = 0.0
+        self._priority_timestamp: float = 0.0
         interior_view = base.carla.Transform(
             base.carla.Location(x=0.5, y=0.0, z=1.2),
             base.carla.Rotation(pitch=0.0),
@@ -546,7 +579,8 @@ class LiveDetectionCameraManager(base.CameraManager):
 
     def _draw_detections(self, surface: pygame.Surface, detections: Sequence[DetectionItem]) -> None:
         width, height = surface.get_width(), surface.get_height()
-        for detection in detections:
+        detection_list = list(detections)
+        for detection in detection_list:
             x1, y1, x2, y2 = detection.bbox
             x1 = max(0, min(width - 1, x1))
             y1 = max(0, min(height - 1, y1))
@@ -555,6 +589,8 @@ class LiveDetectionCameraManager(base.CameraManager):
             if x2 <= x1 or y2 <= y1:
                 continue
             self._draw_label(surface, x1, y1, detection.text, detection.color)
+        self._update_priority_panel(detection_list)
+        self._draw_priority_panel(surface)
 
     def _draw_label(self, surface: pygame.Surface, x: int, y: int, label: str, color: Tuple[int, int, int]) -> None:
         label_surface = self._get_label_surface(label, color)
@@ -574,6 +610,73 @@ class LiveDetectionCameraManager(base.CameraManager):
             self._label_cache[cache_key] = label_surface
             cached = label_surface
         return cached.copy()
+
+    def _compute_priority_score(self, detection: DetectionItem) -> float:
+        source = detection.source_label.lower()
+        display = detection.label.lower()
+        weight = 0.4
+        if (
+            'regulatory' in source
+            or display.startswith('speed limit')
+            or 'stop' in display
+            or 'yield' in display
+        ):
+            weight = 1.0
+        elif 'warning' in source or display.startswith('warning'):
+            weight = 0.7
+        elif 'information' in source or display.startswith('information'):
+            weight = 0.4
+        confidence = max(0.0, min(1.0, detection.confidence))
+        return 0.8 * weight + 0.2 * confidence
+
+    def _update_priority_panel(self, detections: Sequence[DetectionItem]) -> None:
+        now = time.time()
+        best: Optional[Tuple[str, float]] = None
+        for detection in detections:
+            score = self._compute_priority_score(detection)
+            if best is None or score > best[1]:
+                best = (detection.label, score)
+        if best is None:
+            if self._priority_label and now - self._priority_timestamp > 1.0:
+                self._priority_label = None
+            return
+        candidate_label, candidate_score = best
+        if self._priority_label is None:
+            self._priority_label = candidate_label
+            self._priority_score = candidate_score
+            self._priority_timestamp = now
+            return
+        if candidate_label == self._priority_label:
+            self._priority_score = candidate_score
+            self._priority_timestamp = now
+            return
+        if now - self._priority_timestamp < 1.0:
+            if candidate_score >= self._priority_score * 1.2:
+                self._priority_label = candidate_label
+                self._priority_score = candidate_score
+                self._priority_timestamp = now
+        else:
+            self._priority_label = candidate_label
+            self._priority_score = candidate_score
+            self._priority_timestamp = now
+
+    def _draw_priority_panel(self, surface: pygame.Surface) -> None:
+        if not self._priority_label:
+            return
+        now = time.time()
+        if now - self._priority_timestamp > 1.0:
+            self._priority_label = None
+            return
+        text_surface = self._priority_font.render(self._priority_label, True, (255, 255, 255))
+        padding = 12
+        width = text_surface.get_width() + padding * 2
+        height = text_surface.get_height() + padding * 2
+        panel_surface = pygame.Surface((width, height), pygame.SRCALPHA)
+        panel_surface.fill((*self.BG_COLOR, 170))
+        panel_surface.blit(text_surface, (padding, padding))
+        x = max(0, (surface.get_width() - width) // 2)
+        y = max(0, surface.get_height() - height - 20)
+        surface.blit(panel_surface, (x, y))
 
     @staticmethod
     def _transforms_equal(a: 'base.carla.Transform', b: 'base.carla.Transform', tol: float = 1e-3) -> bool:
