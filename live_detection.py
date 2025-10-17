@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import cv2
 import numpy as np
 import pygame
 
@@ -64,9 +65,17 @@ DEFAULT_LABEL_PRIORITY_WEIGHTS.update({
     'speed limit': 1.0,
     'yield': 1.2,
     'stop': 1.3,
+    'traffic-light-red': 1.1,
+    'traffic-light-green': 1.0,
+    'traffic-light-yellow': 1.0,
 })
 DEFAULT_SPEED_OVER_WEIGHT = 1.2
 DEFAULT_SPEED_TOLERANCE_KPH = 2.0
+TRAFFIC_LIGHT_STATE_COLORS: Dict[str, Tuple[int, int, int]] = {
+    'red': (255, 0, 0),
+    'yellow': (255, 255, 0),
+    'green': (0, 220, 0),
+}
 
 
 def parse_sign_labels_arg(raw: Optional[str]) -> Set[str]:
@@ -364,6 +373,14 @@ class DetectionContext:
             display_label = raw_label
             display_confidence = float(score)
             sign_class: Optional[str] = None
+            if label_lower in {'traffic light', 'traffic_light'}:
+                traffic_result = self._classify_traffic_light(frame_rgb, (x1, y1, x2, y2))
+                if traffic_result is not None:
+                    state, state_conf = traffic_result
+                    display_label = f"Traffic Light {state.capitalize()}"
+                    display_confidence = (display_confidence + state_conf) / 2.0
+                    sign_class = f"traffic-light-{state}"
+                    color = TRAFFIC_LIGHT_STATE_COLORS.get(state, color)
             if label_lower in self._sign_labels and self._resnet_model is not None and self._resnet_transform is not None:
                 classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2), timestamp)
                 if classified is not None:
@@ -444,6 +461,50 @@ class DetectionContext:
         self._update_sign_cache(bbox, label, base_class_lower, confidence_value, timestamp)
         return label, confidence_value, base_class_lower
 
+    def _classify_traffic_light(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[Tuple[str, float]]:
+        x1, y1, x2, y2 = bbox
+        crop = frame_rgb[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        h, w = crop.shape[:2]
+        if h < 10 or w < 10:
+            return None
+        resized = cv2.resize(crop, (60, 120), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(resized, cv2.COLOR_RGB2HSV)
+        red_mask1 = cv2.inRange(hsv, (0, 90, 120), (10, 255, 255))
+        red_mask2 = cv2.inRange(hsv, (170, 90, 120), (180, 255, 255))
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        yellow_mask = cv2.inRange(hsv, (15, 90, 120), (35, 255, 255))
+        green_mask = cv2.inRange(hsv, (40, 90, 100), (90, 255, 255))
+        height = hsv.shape[0]
+        thirds = [
+            (0, int(height * 0.33)),
+            (int(height * 0.33), int(height * 0.66)),
+            (int(height * 0.66), height),
+        ]
+
+        def region_score(mask: np.ndarray, region: Tuple[int, int]) -> float:
+            start, end = region
+            roi = mask[start:end, :]
+            if roi.size == 0:
+                return 0.0
+            return float(np.sum(roi)) / (roi.size * 255.0)
+
+        red_score = region_score(red_mask, thirds[0]) * 1.3 + float(np.sum(red_mask)) / (red_mask.size * 255.0) * 0.4
+        yellow_score = region_score(yellow_mask, thirds[1]) * 1.3 + float(np.sum(yellow_mask)) / (yellow_mask.size * 255.0) * 0.4
+        green_score = region_score(green_mask, thirds[2]) * 1.3 + float(np.sum(green_mask)) / (green_mask.size * 255.0) * 0.4
+        scores = {
+            'red': red_score,
+            'yellow': yellow_score,
+            'green': green_score,
+        }
+        best_state, best_score = max(scores.items(), key=lambda item: item[1])
+        total = sum(scores.values())
+        if total <= 0 or best_score < 0.05:
+            return None
+        confidence = best_score / (total + 1e-6)
+        return best_state, confidence
+
     def _lookup_sign_cache(self, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[SignCacheEntry]:
         if not self._sign_cache:
             return None
@@ -522,7 +583,10 @@ class DetectionContext:
     @staticmethod
     def _categorize_sign(sign_class: Optional[str], display_label: str, fallback_label: str) -> str:
         if sign_class:
-            category = CLASS_CATEGORY_MAP.get(sign_class.lower())
+            lowered = sign_class.lower()
+            if lowered.startswith('traffic-light'):
+                return 'regulatory'
+            category = CLASS_CATEGORY_MAP.get(lowered)
             if category:
                 return category
         for candidate in (display_label.lower(), fallback_label.lower()):
@@ -570,6 +634,8 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._speed_over_weight = detection.speed_priority_boost
         self._speed_tolerance_kph = detection.speed_tolerance_kph
         self._current_speed = 0.0
+        self._label_visibility: Dict[str, int] = {}
+        self._min_priority_frames = 3
         interior_view = base.carla.Transform(
             base.carla.Location(x=0.5, y=0.0, z=1.2),
             base.carla.Rotation(pitch=0.0),
@@ -776,8 +842,17 @@ class LiveDetectionCameraManager(base.CameraManager):
         except Exception:  # pylint: disable=broad-except
             current_speed = 0.0
         self._current_speed = current_speed
+        current_labels = {d.label for d in detections}
+        for label in current_labels:
+            self._label_visibility[label] = self._label_visibility.get(label, 0) + 1
+        for label in list(self._label_visibility.keys()):
+            if label not in current_labels:
+                self._label_visibility.pop(label, None)
+
         best: Optional[Tuple[str, float, str, Optional[str]]] = None
         for detection in detections:
+            if self._label_visibility.get(detection.label, 0) < self._min_priority_frames:
+                continue
             score = self._compute_priority_score(detection, current_speed)
             if best is None or score > best[1]:
                 best = (detection.label, score, detection.yolo_label, detection.sign_class)
