@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CARLA manual control with optional YOLOv11 live detection overlay."""
+"""CARLA keyboard manual control with optional YOLOv11 live detection overlay."""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 import pygame
 
-import manual_control_steeringwheel as base
+import manual_control as base
 import torch
 import torch.nn.functional as F
 import torchvision
