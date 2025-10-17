@@ -40,6 +40,33 @@ SPEED_LIMIT_VALUES: Set[str] = {
     '5', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55', '60',
     '65', '70', '75', '80', '85', '90', '95', '100', '110', '120', '130'
 }
+CLASS_CATEGORY_MAP: Dict[str, str] = {
+    name.lower(): name.split('--', 1)[0] for name in RESNET_CLASS_NAMES
+}
+DEFAULT_CLASS_PRIORITY_WEIGHTS: Dict[str, float] = {
+    'regulatory': 1.0,
+    'warning': 0.7,
+    'information': 0.4,
+    'other': 0.4,
+}
+DEFAULT_LABEL_PRIORITY_WEIGHTS: Dict[str, float] = {
+    name.lower(): DEFAULT_CLASS_PRIORITY_WEIGHTS.get(
+        CLASS_CATEGORY_MAP.get(name.lower(), 'other'),
+        DEFAULT_CLASS_PRIORITY_WEIGHTS['other'],
+    )
+    for name in RESNET_CLASS_NAMES
+}
+DEFAULT_LABEL_PRIORITY_WEIGHTS.update({
+    'regulatory--yield--g1': 1.2,
+    'regulatory--stop--g1': 1.3,
+    'regulatory--maximum-speed-limit--g1': 1.0,
+    'speed-limit': 1.0,
+    'speed limit': 1.0,
+    'yield': 1.2,
+    'stop': 1.3,
+})
+DEFAULT_SPEED_OVER_WEIGHT = 1.2
+DEFAULT_SPEED_TOLERANCE_KPH = 2.0
 
 
 def parse_sign_labels_arg(raw: Optional[str]) -> Set[str]:
@@ -59,7 +86,10 @@ class DetectionItem:
     color: Tuple[int, int, int]
     label: str
     confidence: float
-    source_label: str
+    sign_class: Optional[str]
+    category: str
+    speed_limit: Optional[float]
+    yolo_label: str
 
 
 @dataclass(frozen=True)
@@ -72,6 +102,7 @@ class DetectionSnapshot:
 class SignCacheEntry:
     bbox: Tuple[int, int, int, int]
     label: str
+    base_class: Optional[str]
     confidence: float
     timestamp: float
 
@@ -120,6 +151,10 @@ class DetectionContext:
         self._torch_device: Optional[torch.device] = None
         self._sign_cache: List[SignCacheEntry] = []
         self._speed_limit_ocr = SpeedLimitOCR()
+        self.class_priority_weights: Dict[str, float] = dict(DEFAULT_CLASS_PRIORITY_WEIGHTS)
+        self.label_priority_weights: Dict[str, float] = dict(DEFAULT_LABEL_PRIORITY_WEIGHTS)
+        self.speed_priority_boost = DEFAULT_SPEED_OVER_WEIGHT
+        self.speed_tolerance_kph = DEFAULT_SPEED_TOLERANCE_KPH
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
@@ -328,10 +363,11 @@ class DetectionContext:
             color = self._resolve_color(label_lower)
             display_label = raw_label
             display_confidence = float(score)
+            sign_class: Optional[str] = None
             if label_lower in self._sign_labels and self._resnet_model is not None and self._resnet_transform is not None:
                 classified = self._classify_sign(frame_rgb, (x1, y1, x2, y2), timestamp)
                 if classified is not None:
-                    sign_label, confidence = classified
+                    sign_label, confidence, base_class = classified
                     display_label = self._format_sign_label(sign_label)
                     if sign_label == OTHER_SIGN_LABEL:
                         color = self._resolve_color(OTHER_SIGN_LABEL)
@@ -340,6 +376,10 @@ class DetectionContext:
                     else:
                         color = self._resolve_color('traffic sign')
                     display_confidence = confidence
+                    if base_class:
+                        sign_class = base_class.lower()
+            speed_limit_value = self._parse_speed_limit(display_label)
+            category = self._categorize_sign(sign_class, display_label, raw_label)
             text = f"{display_label} ({display_confidence:.2f})"
             items.append(DetectionItem(
                 bbox=(x1, y1, x2, y2),
@@ -347,7 +387,10 @@ class DetectionContext:
                 color=color,
                 label=display_label,
                 confidence=display_confidence,
-                source_label=raw_label,
+                sign_class=sign_class,
+                category=category,
+                speed_limit=speed_limit_value,
+                yolo_label=raw_label,
             ))
         return tuple(items)
 
@@ -357,12 +400,12 @@ class DetectionContext:
             return BOX_COLOR_MAP.get('speed-limit', BOX_COLOR_MAP.get('traffic sign', DEFAULT_BOX_COLOR))
         return BOX_COLOR_MAP.get(label_lower, DEFAULT_BOX_COLOR)
 
-    def _classify_sign(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[Tuple[str, float]]:
+    def _classify_sign(self, frame_rgb: np.ndarray, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[Tuple[str, float, Optional[str]]]:
         if self._resnet_model is None or self._resnet_transform is None or self._torch_device is None:
             return None
         cached = self._lookup_sign_cache(bbox, timestamp)
         if cached is not None:
-            return cached.label, cached.confidence
+            return cached.label, cached.confidence, cached.base_class
         x1, y1, x2, y2 = bbox
         cropped = frame_rgb[y1:y2, x1:x2]
         if cropped.size == 0:
@@ -373,14 +416,15 @@ class DetectionContext:
             output = self._resnet_model(input_tensor)
             probabilities = F.softmax(output, dim=1)
             confidence, predicted_idx = torch.max(probabilities, dim=1)
-        label = RESNET_CLASS_NAMES[predicted_idx.item()]
-        original_label = label
+        base_class = RESNET_CLASS_NAMES[predicted_idx.item()]
+        base_class_lower = base_class.lower()
+        label = base_class
         confidence_value = float(confidence.item())
 
         ocr_result = None
         if (
-            'maximum-speed-limit' in label
-            or label == OTHER_SIGN_LABEL
+            'maximum-speed-limit' in base_class
+            or base_class == OTHER_SIGN_LABEL
             or label.startswith('speed-limit')
         ):
             crop_rgb = frame_rgb[y1:y2, x1:x2]
@@ -389,16 +433,16 @@ class DetectionContext:
                 label = f"speed-limit-{ocr_result.value}"
                 confidence_value = float((confidence_value + ocr_result.score) / 2.0)
             else:
-                extracted = self._extract_speed_value(original_label)
+                extracted = self._extract_speed_value(base_class)
                 if extracted is not None:
                     label = f"speed-limit-{extracted}"
-                elif 'maximum-speed-limit' in label and not label.startswith('speed-limit-'):
+                elif 'maximum-speed-limit' in base_class and not label.startswith('speed-limit-'):
                     label = 'speed-limit'
 
         if confidence_value < self.sign_conf_threshold:
-            return OTHER_SIGN_LABEL, confidence_value
-        self._update_sign_cache(bbox, label, confidence_value, timestamp)
-        return label, confidence_value
+            return OTHER_SIGN_LABEL, confidence_value, base_class_lower
+        self._update_sign_cache(bbox, label, base_class_lower, confidence_value, timestamp)
+        return label, confidence_value, base_class_lower
 
     def _lookup_sign_cache(self, bbox: Tuple[int, int, int, int], timestamp: float) -> Optional[SignCacheEntry]:
         if not self._sign_cache:
@@ -419,8 +463,8 @@ class DetectionContext:
             return None
         return best_entry
 
-    def _update_sign_cache(self, bbox: Tuple[int, int, int, int], label: str, confidence: float, timestamp: float) -> None:
-        entry = SignCacheEntry(bbox=bbox, label=label, confidence=confidence, timestamp=timestamp)
+    def _update_sign_cache(self, bbox: Tuple[int, int, int, int], label: str, base_class: Optional[str], confidence: float, timestamp: float) -> None:
+        entry = SignCacheEntry(bbox=bbox, label=label, base_class=base_class.lower() if base_class else None, confidence=confidence, timestamp=timestamp)
         self._sign_cache.append(entry)
         if len(self._sign_cache) > 32:
             self._sign_cache = self._sign_cache[-32:]
@@ -475,6 +519,33 @@ class DetectionContext:
                 return digits
         return None
 
+    @staticmethod
+    def _categorize_sign(sign_class: Optional[str], display_label: str, fallback_label: str) -> str:
+        if sign_class:
+            category = CLASS_CATEGORY_MAP.get(sign_class.lower())
+            if category:
+                return category
+        for candidate in (display_label.lower(), fallback_label.lower()):
+            if candidate.startswith('regulatory') or 'speed limit' in candidate or 'yield' in candidate or 'stop' in candidate:
+                return 'regulatory'
+            if candidate.startswith('warning') or 'warning' in candidate:
+                return 'warning'
+            if candidate.startswith('information') or 'information' in candidate or 'parking' in candidate:
+                return 'information'
+        return 'other'
+
+    def _parse_speed_limit(self, display_label: str) -> Optional[float]:
+        digits = self._extract_speed_value(display_label)
+        if digits is None:
+            return None
+        if digits not in SPEED_LIMIT_VALUES:
+            return None
+        try:
+            value = float(digits)
+        except ValueError:
+            return None
+        return value
+
 
 
 class LiveDetectionCameraManager(base.CameraManager):
@@ -494,6 +565,11 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._priority_label: Optional[str] = None
         self._priority_score: float = 0.0
         self._priority_timestamp: float = 0.0
+        self._class_weights = {key.lower(): value for key, value in detection.class_priority_weights.items()}
+        self._label_weights = {key.lower(): value for key, value in detection.label_priority_weights.items()}
+        self._speed_over_weight = detection.speed_priority_boost
+        self._speed_tolerance_kph = detection.speed_tolerance_kph
+        self._current_speed = 0.0
         interior_view = base.carla.Transform(
             base.carla.Location(x=0.5, y=0.0, z=1.2),
             base.carla.Rotation(pitch=0.0),
@@ -611,29 +687,38 @@ class LiveDetectionCameraManager(base.CameraManager):
             cached = label_surface
         return cached.copy()
 
-    def _compute_priority_score(self, detection: DetectionItem) -> float:
-        source = detection.source_label.lower()
-        display = detection.label.lower()
-        weight = 0.4
-        if (
-            'regulatory' in source
-            or display.startswith('speed limit')
-            or 'stop' in display
-            or 'yield' in display
-        ):
-            weight = 1.0
-        elif 'warning' in source or display.startswith('warning'):
-            weight = 0.7
-        elif 'information' in source or display.startswith('information'):
-            weight = 0.4
+    def _compute_priority_score(self, detection: DetectionItem, current_speed: float) -> float:
+        class_key = detection.category.lower() if detection.category else 'other'
+        class_weight = self._class_weights.get(class_key, self._class_weights.get('other', 0.4))
+        label_weight = None
+        if detection.sign_class:
+            label_weight = self._label_weights.get(detection.sign_class, None)
+        if label_weight is None:
+            display = detection.label.lower()
+            for key, weight in self._label_weights.items():
+                if display.startswith(key):
+                    label_weight = weight
+                    break
+        if label_weight is None:
+            label_weight = self._label_weights.get(detection.yolo_label.lower())
+        effective_weight = label_weight if label_weight is not None else class_weight
+        if detection.speed_limit is not None and detection.speed_limit > 0:
+            if current_speed - detection.speed_limit > self._speed_tolerance_kph:
+                effective_weight = max(effective_weight, self._speed_over_weight)
         confidence = max(0.0, min(1.0, detection.confidence))
-        return 0.8 * weight + 0.2 * confidence
+        return 0.8 * effective_weight + 0.2 * confidence
 
     def _update_priority_panel(self, detections: Sequence[DetectionItem]) -> None:
         now = time.time()
+        try:
+            velocity = self._parent.get_velocity()
+            current_speed = math.sqrt(velocity.x ** 2 + velocity.y ** 2 + velocity.z ** 2) * 3.6
+        except Exception:  # pylint: disable=broad-except
+            current_speed = 0.0
+        self._current_speed = current_speed
         best: Optional[Tuple[str, float]] = None
         for detection in detections:
-            score = self._compute_priority_score(detection)
+            score = self._compute_priority_score(detection, current_speed)
             if best is None or score > best[1]:
                 best = (detection.label, score)
         if best is None:
