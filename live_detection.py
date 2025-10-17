@@ -10,6 +10,7 @@ import os
 import queue
 import threading
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -634,8 +635,9 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._speed_over_weight = detection.speed_priority_boost
         self._speed_tolerance_kph = detection.speed_tolerance_kph
         self._current_speed = 0.0
-        self._label_visibility: Dict[str, int] = {}
-        self._min_priority_frames = 3
+        self._history_window = 10
+        self._recent_detections: deque[Sequence[DetectionItem]] = deque(maxlen=self._history_window)
+        self._min_priority_occurrences = 3
         interior_view = base.carla.Transform(
             base.carla.Location(x=0.5, y=0.0, z=1.2),
             base.carla.Rotation(pitch=0.0),
@@ -842,52 +844,51 @@ class LiveDetectionCameraManager(base.CameraManager):
         except Exception:  # pylint: disable=broad-except
             current_speed = 0.0
         self._current_speed = current_speed
-        current_labels = {d.label for d in detections}
-        for label in current_labels:
-            self._label_visibility[label] = self._label_visibility.get(label, 0) + 1
-        for label in list(self._label_visibility.keys()):
-            if label not in current_labels:
-                self._label_visibility.pop(label, None)
+        self._recent_detections.append(tuple(detections))
+        if not self._recent_detections:
+            self._priority_label = None
+            self._priority_score = 0.0
+            self._priority_timestamp = now
+            return
 
-        best: Optional[Tuple[str, float, str, Optional[str]]] = None
-        for detection in detections:
-            if self._label_visibility.get(detection.label, 0) < self._min_priority_frames:
+        aggregated: Dict[str, Dict[str, object]] = defaultdict(lambda: {
+            'score': 0.0,
+            'count': 0,
+            'last': None,
+        })
+        for frame_items in self._recent_detections:
+            for detection in frame_items:
+                entry = aggregated[detection.label]
+                entry['score'] = float(entry['score']) + self._compute_priority_score(detection, current_speed)
+                entry['count'] = int(entry['count']) + 1
+                entry['last'] = detection
+
+        best: Optional[Tuple[str, float, DetectionItem]] = None
+        for label, data in aggregated.items():
+            count = int(data['count']) if data['count'] is not None else 0
+            if count < self._min_priority_occurrences:
                 continue
-            score = self._compute_priority_score(detection, current_speed)
-            if best is None or score > best[1]:
-                best = (detection.label, score, detection.yolo_label, detection.sign_class)
+            avg_score = float(data['score']) / max(count, 1)
+            detection = data['last']
+            if detection is None:
+                continue
+            if best is None or avg_score > best[1]:
+                best = (label, avg_score, detection)
+
         if best is None:
-            if self._priority_label and now - self._priority_timestamp > 1.0:
-                self._priority_label = None
-            return
-        candidate_display, candidate_score, candidate_raw, candidate_class = best
-        candidate_priority = self._format_priority_label(candidate_display, candidate_raw, candidate_class)
-        candidate_key = candidate_priority
-        if self._priority_label is None:
-            self._priority_label = candidate_key
-            self._priority_score = candidate_score
+            self._priority_label = None
+            self._priority_score = 0.0
             self._priority_timestamp = now
             return
-        if candidate_key == self._priority_label:
-            self._priority_score = candidate_score
-            self._priority_timestamp = now
-            return
-        if now - self._priority_timestamp < 1.0:
-            if candidate_score >= self._priority_score * 1.2:
-                self._priority_label = candidate_key
-                self._priority_score = candidate_score
-                self._priority_timestamp = now
-        else:
-            self._priority_label = candidate_key
-            self._priority_score = candidate_score
-            self._priority_timestamp = now
+
+        label, score, detection = best
+        candidate_priority = self._format_priority_label(detection.label, detection.yolo_label, detection.sign_class)
+        self._priority_label = candidate_priority
+        self._priority_score = score
+        self._priority_timestamp = now
 
     def _draw_priority_panel(self, surface: pygame.Surface) -> None:
         if not self._priority_label:
-            return
-        now = time.time()
-        if now - self._priority_timestamp > 1.0:
-            self._priority_label = None
             return
         display_text = self._priority_label
         text_surface = self._priority_font.render(display_text, True, (255, 255, 255))
