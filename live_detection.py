@@ -708,6 +708,66 @@ class LiveDetectionCameraManager(base.CameraManager):
         confidence = max(0.0, min(1.0, detection.confidence))
         return 0.8 * effective_weight + 0.2 * confidence
 
+    @staticmethod
+    def _simplify_hierarchical_label(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        lowered = value.strip().lower()
+        if not lowered:
+            return None
+        if '--' in lowered:
+            parts = lowered.split('--')
+            parts = parts[1:]  # drop prefix category
+        else:
+            parts = lowered.split('-')
+        if parts and re.fullmatch(r'g\d+[a-z]?$', parts[-1]):
+            parts = parts[:-1]
+        if not parts:
+            return None
+        text = ' '.join(parts)
+        text = text.replace('-', ' ')
+        text = ' '.join(word.capitalize() for word in text.split())
+        return text or None
+
+    @staticmethod
+    def _clean_display_label(label: str) -> str:
+        if not label:
+            return label
+        text = label.strip()
+        if not text:
+            return text
+        text = re.sub(r'\b(Regulatory|Warning|Information)\b', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\bG\d+[A-Z]?\b', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text:
+            return label
+        tokens = []
+        for token in text.split():
+            if token.isalpha():
+                tokens.append(token.capitalize())
+            else:
+                tokens.append(token)
+        return ' '.join(tokens)
+
+    def _format_priority_label(self, display_label: str, raw_label: str, sign_class: Optional[str]) -> str:
+        if sign_class and 'speed-limit' in sign_class:
+            cleaned_speed = self._clean_display_label(display_label)
+            if re.search(r'\d', cleaned_speed):
+                return cleaned_speed
+        candidate = self._simplify_hierarchical_label(sign_class)
+        if candidate:
+            return candidate
+        candidate = self._simplify_hierarchical_label(raw_label)
+        if candidate:
+            return candidate
+        cleaned_display = self._clean_display_label(display_label)
+        if cleaned_display:
+            return cleaned_display
+        cleaned_raw = self._clean_display_label(raw_label)
+        if cleaned_raw:
+            return cleaned_raw
+        return display_label
+
     def _update_priority_panel(self, detections: Sequence[DetectionItem]) -> None:
         now = time.time()
         try:
@@ -716,32 +776,34 @@ class LiveDetectionCameraManager(base.CameraManager):
         except Exception:  # pylint: disable=broad-except
             current_speed = 0.0
         self._current_speed = current_speed
-        best: Optional[Tuple[str, float]] = None
+        best: Optional[Tuple[str, float, str, Optional[str]]] = None
         for detection in detections:
             score = self._compute_priority_score(detection, current_speed)
             if best is None or score > best[1]:
-                best = (detection.label, score)
+                best = (detection.label, score, detection.yolo_label, detection.sign_class)
         if best is None:
             if self._priority_label and now - self._priority_timestamp > 1.0:
                 self._priority_label = None
             return
-        candidate_label, candidate_score = best
+        candidate_display, candidate_score, candidate_raw, candidate_class = best
+        candidate_priority = self._format_priority_label(candidate_display, candidate_raw, candidate_class)
+        candidate_key = candidate_priority
         if self._priority_label is None:
-            self._priority_label = candidate_label
+            self._priority_label = candidate_key
             self._priority_score = candidate_score
             self._priority_timestamp = now
             return
-        if candidate_label == self._priority_label:
+        if candidate_key == self._priority_label:
             self._priority_score = candidate_score
             self._priority_timestamp = now
             return
         if now - self._priority_timestamp < 1.0:
             if candidate_score >= self._priority_score * 1.2:
-                self._priority_label = candidate_label
+                self._priority_label = candidate_key
                 self._priority_score = candidate_score
                 self._priority_timestamp = now
         else:
-            self._priority_label = candidate_label
+            self._priority_label = candidate_key
             self._priority_score = candidate_score
             self._priority_timestamp = now
 
@@ -752,7 +814,8 @@ class LiveDetectionCameraManager(base.CameraManager):
         if now - self._priority_timestamp > 1.0:
             self._priority_label = None
             return
-        text_surface = self._priority_font.render(self._priority_label, True, (255, 255, 255))
+        display_text = self._priority_label
+        text_surface = self._priority_font.render(display_text, True, (255, 255, 255))
         padding = 12
         width = text_surface.get_width() + padding * 2
         height = text_surface.get_height() + padding * 2
