@@ -390,7 +390,7 @@ class DetectionContext:
                     sign_label, confidence, base_class = classified
                     display_label = self._format_sign_label(sign_label)
                     if sign_label == OTHER_SIGN_LABEL:
-                        color = self._resolve_color(OTHER_SIGN_LABEL)
+                        continue
                     elif sign_label == 'speed-limit' or sign_label.startswith('speed-limit-'):
                         color = self._resolve_color('speed-limit')
                     else:
