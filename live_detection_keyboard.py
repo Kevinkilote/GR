@@ -1067,20 +1067,25 @@ class LiveDetectionCameraManager(base.CameraManager):
 class LiveDetectionWorld(base.World):
     """World wrapper that swaps in a detection-aware camera manager."""
 
-    def __init__(self, carla_world, hud, actor_filter, detection: DetectionContext, sim_fps: Optional[float]):
+    def __init__(self, carla_world, hud, args, detection: DetectionContext, sim_fps: Optional[float]):
         self._detection = detection
         self._sim_fps = sim_fps if sim_fps and sim_fps > 0 else None
         self._original_settings = carla_world.get_settings()
         self._sync_mode_enabled = False
         mc_args = SimpleNamespace(
-            filter=actor_filter,
-            gamma=2.2,
+            filter=getattr(args, 'filter', 'vehicle.*'),
+            generation=getattr(args, 'generation', 'all'),
+            gamma=getattr(args, 'gamma', 2.2),
+            host=getattr(args, 'host', '127.0.0.1'),
+            port=getattr(args, 'port', 2000),
             sync=False,
             no_rendering_mode=False,
             show_waypoints=False,
             show_route=False,
             use_advanced_lidar=False,
             carla_settings=None,
+            rolename=getattr(args, 'rolename', 'hero'),
+            autopilot=getattr(args, 'autopilot', False),
         )
         if self._sim_fps:
             self._enable_sync_mode(carla_world, self._sim_fps)
@@ -1265,7 +1270,7 @@ def game_loop(args):
             pygame.HWSURFACE | pygame.DOUBLEBUF,
         )
         hud = base.HUD(args.width, args.height)
-        world = LiveDetectionWorld(client.get_world(), hud, args.filter, detection_context, args.sim_fps)
+        world = LiveDetectionWorld(client.get_world(), hud, args, detection_context, args.sim_fps)
         controller = LiveKeyboardControl(world, args.autopilot, detection_context)
         clock = pygame.time.Clock()
         target_fps = int(round(args.sim_fps)) if args.sim_fps > 0 else 0
