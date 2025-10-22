@@ -169,6 +169,7 @@ class DetectionContext:
         self.speed_tolerance_kph = DEFAULT_SPEED_TOLERANCE_KPH
         self.task_focus = task_focus.lower().strip()
         self.show_overlays = bool(show_overlays)
+        self.min_priority_frames = 3
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
@@ -649,7 +650,7 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._current_speed = 0.0
         self._history_window = 10
         self._recent_detections: deque[Sequence[DetectionItem]] = deque(maxlen=self._history_window)
-        self._min_priority_occurrences = 3
+        self._min_priority_occurrences = max(1, getattr(detection, 'min_priority_frames', 3))
         self._priority_category: Optional[str] = None
         self._priority_start_time: float = 0.0
         self._cooldown_until: float = 0.0
@@ -1136,43 +1137,32 @@ class LiveDetectionWorld(base.World):
         super().tick(clock)
 
 
-class LiveDualControl(base.DualControl):
-    """Extends DualControl to toggle live detection from input events."""
+class LiveKeyboardControl:
+    """Keyboard controller that integrates live detection toggling."""
 
-    def __init__(self, world, start_in_autopilot, detection: DetectionContext, detect_button: Optional[int]):
+    def __init__(self, world, start_in_autopilot: bool, detection: DetectionContext):
+        self._world = world
         self._detection = detection
-        self._detect_button = detect_button if detect_button is None or detect_button >= 0 else None
-        super().__init__(world, start_in_autopilot)
+        self._autopilot_enabled = start_in_autopilot
+        self._control = base.carla.VehicleControl()
+        self._steer_cache = 0.0
+        if self._autopilot_enabled:
+            self._world.player.set_autopilot(True)
+            self._world.hud.notification('Autopilot On')
+        else:
+            self._world.player.set_autopilot(False)
 
-    def parse_events(self, world, clock):  # noqa: D401
+    def parse_events(self, world, clock):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return True
-            if event.type == pygame.JOYBUTTONDOWN:
-                if self._detect_button is not None and event.button == self._detect_button:
-                    self._handle_detection_toggle(world)
-                    continue
-                if event.button == 0:
-                    world.restart()
-                elif event.button == 1:
-                    world.hud.toggle_info()
-                elif event.button == 2:
-                    world.camera_manager.toggle_camera()
-                elif event.button == 3:
-                    world.next_weather()
-                elif event.button == self._reverse_idx:
-                    self._control.gear = 1 if self._control.reverse else -1
-                elif event.button == 23:
-                    world.camera_manager.next_sensor()
-            elif event.type == pygame.KEYUP:
+            if event.type == pygame.KEYUP:
                 if self._is_quit_shortcut(event.key):
                     return True
                 if event.key == pygame.K_BACKSPACE:
                     world.restart()
                 elif event.key == pygame.K_F1:
                     world.hud.toggle_info()
-                elif event.key == pygame.K_h or (event.key == pygame.K_SLASH and pygame.key.get_mods() & pygame.KMOD_SHIFT):
-                    world.hud.help.toggle()
                 elif event.key == pygame.K_TAB:
                     world.camera_manager.toggle_camera()
                 elif event.key == pygame.K_c and pygame.key.get_mods() & pygame.KMOD_SHIFT:
@@ -1181,35 +1171,45 @@ class LiveDualControl(base.DualControl):
                     world.next_weather()
                 elif event.key == pygame.K_BACKQUOTE:
                     world.camera_manager.next_sensor()
-                elif event.key > pygame.K_0 and event.key <= pygame.K_9:
-                    world.camera_manager.set_sensor(event.key - 1 - pygame.K_0)
                 elif event.key == pygame.K_r:
                     world.camera_manager.toggle_recording()
                 elif event.key == pygame.K_l:
                     self._handle_detection_toggle(world)
-                if isinstance(self._control, base.carla.VehicleControl):
-                    if event.key == pygame.K_q:
-                        self._control.gear = 1 if self._control.reverse else -1
-                    elif event.key == pygame.K_m:
-                        self._control.manual_gear_shift = not self._control.manual_gear_shift
-                        self._control.gear = world.player.get_control().gear
-                        world.hud.notification('Manual Transmission' if self._control.manual_gear_shift else 'Automatic Transmission')
-                    elif self._control.manual_gear_shift and event.key == pygame.K_COMMA:
-                        self._control.gear = max(-1, self._control.gear - 1)
-                    elif self._control.manual_gear_shift and event.key == pygame.K_PERIOD:
-                        self._control.gear += 1
-                    elif event.key == pygame.K_p:
-                        self._autopilot_enabled = not self._autopilot_enabled
-                        world.player.set_autopilot(self._autopilot_enabled)
-                        world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
+                elif event.key == pygame.K_p:
+                    self._autopilot_enabled = not self._autopilot_enabled
+                    world.player.set_autopilot(self._autopilot_enabled)
+                    world.hud.notification('Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
         if not self._autopilot_enabled:
-            if isinstance(self._control, base.carla.VehicleControl):
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
-                self._parse_vehicle_wheel()
-                self._control.reverse = self._control.gear < 0
-            elif isinstance(self._control, base.carla.WalkerControl):
-                self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time())
+            keys = pygame.key.get_pressed()
+            self._parse_vehicle_keys(keys, clock.get_time())
+            self._control.reverse = self._control.gear < 0
             world.player.apply_control(self._control)
+
+    def _parse_vehicle_keys(self, keys, milliseconds):
+        self._control.throttle = 0.0
+        self._control.brake = 0.0
+
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            self._control.throttle = min(self._control.throttle + 0.02, 1.0)
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            self._control.brake = min(self._control.brake + 0.1, 1.0)
+        if keys[pygame.K_SPACE]:
+            self._control.brake = 1.0
+
+        steer_increment = 0.07
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            self._steer_cache -= steer_increment
+        elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            self._steer_cache += steer_increment
+        else:
+            self._steer_cache *= 0.9
+        self._steer_cache = max(-1.0, min(1.0, self._steer_cache))
+        self._control.steer = float(self._steer_cache)
+
+        if keys[pygame.K_q]:
+            self._control.gear = -1
+        elif keys[pygame.K_e]:
+            self._control.gear = 1
 
     def _handle_detection_toggle(self, world):
         success, error = self._detection.toggle()
@@ -1219,6 +1219,10 @@ class LiveDualControl(base.DualControl):
             world.hud.notification('Live detection OFF')
         else:
             world.hud.notification(f'Live detection failed: {error}')
+
+    @staticmethod
+    def _is_quit_shortcut(key):
+        return key == pygame.K_ESCAPE or (key == pygame.K_q and pygame.key.get_mods() & pygame.KMOD_CTRL)
 
 
 def game_loop(args):
@@ -1240,6 +1244,7 @@ def game_loop(args):
         task_focus=args.task_focus,
         show_overlays=args.show_overlays,
     )
+    detection_context.min_priority_frames = args.min_priority_frames
     try:
         client = base.carla.Client(args.host, args.port)
         client.set_timeout(2.0)
@@ -1249,7 +1254,7 @@ def game_loop(args):
         )
         hud = base.HUD(args.width, args.height)
         world = LiveDetectionWorld(client.get_world(), hud, args.filter, detection_context, args.sim_fps)
-        controller = LiveDualControl(world, args.autopilot, detection_context, args.detect_button)
+        controller = LiveKeyboardControl(world, args.autopilot, detection_context)
         clock = pygame.time.Clock()
         target_fps = int(round(args.sim_fps)) if args.sim_fps > 0 else 0
         while True:
@@ -1281,7 +1286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sign-labels', default=None, help='comma-separated YOLO class names to refine with ResNet (default uses known traffic sign labels)')
     parser.add_argument('--conf', default=0.25, type=float, help='YOLO confidence threshold (default: 0.25)')
     parser.add_argument('--iou', default=0.45, type=float, help='YOLO IoU threshold (default: 0.45)')
-    parser.add_argument('--device', default=None, help='Torch device for YOLO (e.g., cuda:0)')
+    parser.add_argument('--device', default='cuda:0', help='Torch device for YOLO (default: cuda:0)')
     parser.add_argument('--detection-interval', default=0.05, type=float, help='minimum seconds between YOLO inferences (default: 0.05)')
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep last detections on screen (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
@@ -1289,13 +1294,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
     parser.add_argument('--task-focus', default='none', choices=['none', 'parking', 'speed', 'navigation', 'safety'], help='task context to boost relevant signs')
     parser.add_argument('--hide-boxes', action='store_true', help='hide individual detection overlays and show only priority summary')
+    parser.add_argument('--min-priority-frames', default=3, type=int, help='minimum frames a sign must persist before it can drive priority text (default: 3)')
     parser.add_argument('--sim-fps', default=30.0, type=float, help='target simulation FPS for 1:1 playback (set to 0 to disable throttling)')
-    parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
     args = parser.parse_args()
     args.width, args.height = [int(x) for x in args.res.split('x')]
-    if args.detect_button is not None and args.detect_button < 0:
-        args.detect_button = None
     if args.resnet and args.resnet.strip().lower() == 'none':
         args.resnet = None
     args.sim_fps = max(0.0, float(args.sim_fps))
@@ -1306,6 +1309,7 @@ def parse_args() -> argparse.Namespace:
     args.task_focus = args.task_focus.lower().strip()
     args.skip_labels = {label.strip().lower() for label in args.skip_labels.split(',') if label.strip()} if args.skip_labels else set()
     args.show_overlays = not args.hide_boxes
+    args.min_priority_frames = max(1, int(args.min_priority_frames))
     return args
 
 

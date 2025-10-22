@@ -649,7 +649,7 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._current_speed = 0.0
         self._history_window = 10
         self._recent_detections: deque[Sequence[DetectionItem]] = deque(maxlen=self._history_window)
-        self._min_priority_occurrences = 3
+        self._min_priority_occurrences = max(1, getattr(detection, 'min_priority_frames', 3))
         self._priority_category: Optional[str] = None
         self._priority_start_time: float = 0.0
         self._cooldown_until: float = 0.0
@@ -1240,6 +1240,7 @@ def game_loop(args):
         task_focus=args.task_focus,
         show_overlays=args.show_overlays,
     )
+    detection_context.min_priority_frames = args.min_priority_frames
     try:
         client = base.carla.Client(args.host, args.port)
         client.set_timeout(2.0)
@@ -1281,7 +1282,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sign-labels', default=None, help='comma-separated YOLO class names to refine with ResNet (default uses known traffic sign labels)')
     parser.add_argument('--conf', default=0.25, type=float, help='YOLO confidence threshold (default: 0.25)')
     parser.add_argument('--iou', default=0.45, type=float, help='YOLO IoU threshold (default: 0.45)')
-    parser.add_argument('--device', default=None, help='Torch device for YOLO (e.g., cuda:0)')
+    parser.add_argument('--device', default='cuda:0', help='Torch device for YOLO (default: cuda:0)')
     parser.add_argument('--detection-interval', default=0.05, type=float, help='minimum seconds between YOLO inferences (default: 0.05)')
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep last detections on screen (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
@@ -1306,6 +1307,7 @@ def parse_args() -> argparse.Namespace:
     args.task_focus = args.task_focus.lower().strip()
     args.skip_labels = {label.strip().lower() for label in args.skip_labels.split(',') if label.strip()} if args.skip_labels else set()
     args.show_overlays = not args.hide_boxes
+    args.min_priority_frames = max(1, int(args.min_priority_frames))
     return args
 
 
@@ -1322,3 +1324,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    parser.add_argument('--min-priority-frames', default=3, type=int, help='minimum frames a sign must persist before it can drive priority text (default: 3)')
