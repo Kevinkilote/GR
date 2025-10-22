@@ -169,6 +169,7 @@ class DetectionContext:
         self.speed_tolerance_kph = DEFAULT_SPEED_TOLERANCE_KPH
         self.task_focus = task_focus.lower().strip()
         self.show_overlays = bool(show_overlays)
+        self.min_priority_frames = 3
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""

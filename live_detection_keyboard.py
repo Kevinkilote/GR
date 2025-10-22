@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import torchvision
 from PIL import Image
 from torchvision import transforms
+from types import SimpleNamespace
 
 from speed_limit_ocr import SpeedLimitOCR
 from traffic_sign_recognition import DEFAULT_SIGN_LABELS, OTHER_SIGN_LABEL, RESNET_CLASS_NAMES
@@ -1071,9 +1072,20 @@ class LiveDetectionWorld(base.World):
         self._sim_fps = sim_fps if sim_fps and sim_fps > 0 else None
         self._original_settings = carla_world.get_settings()
         self._sync_mode_enabled = False
+        mc_args = SimpleNamespace(
+            filter=actor_filter,
+            gamma=2.2,
+            sync=False,
+            no_rendering_mode=False,
+            show_waypoints=False,
+            show_route=False,
+            use_advanced_lidar=False,
+            carla_settings=None,
+        )
         if self._sim_fps:
             self._enable_sync_mode(carla_world, self._sim_fps)
-        super().__init__(carla_world, hud, actor_filter)
+            mc_args.sync = True
+        super().__init__(carla_world, hud, mc_args)
 
     def restart(self):
         previous_manager = getattr(self, 'camera_manager', None)
