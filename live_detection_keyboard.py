@@ -134,6 +134,7 @@ class DetectionContext:
         sign_confidence_threshold: float = 0.6,
         skip_labels: Optional[Set[str]] = None,
         task_focus: str = 'none',
+        show_overlays: bool = True,
     ) -> None:
         self.weights_path = weights_path
         self.confidence = conf
@@ -167,6 +168,7 @@ class DetectionContext:
         self.speed_priority_boost = DEFAULT_SPEED_OVER_WEIGHT
         self.speed_tolerance_kph = DEFAULT_SPEED_TOLERANCE_KPH
         self.task_focus = task_focus.lower().strip()
+        self.show_overlays = bool(show_overlays)
 
     def toggle(self) -> Tuple[bool, Optional[Exception]]:
         """Toggle detection on/off, attempting to load the model on-demand."""
@@ -390,7 +392,7 @@ class DetectionContext:
                     sign_label, confidence, base_class = classified
                     display_label = self._format_sign_label(sign_label)
                     if sign_label == OTHER_SIGN_LABEL:
-                        color = self._resolve_color(OTHER_SIGN_LABEL)
+                        continue
                     elif sign_label == 'speed-limit' or sign_label.startswith('speed-limit-'):
                         color = self._resolve_color('speed-limit')
                     else:
@@ -427,10 +429,10 @@ class DetectionContext:
         if cached is not None:
             return cached.label, cached.confidence, cached.base_class
         x1, y1, x2, y2 = bbox
-        cropped = frame_rgb[y1:y2, x1:x2]
-        if cropped.size == 0:
+        crop_rgb = frame_rgb[y1:y2, x1:x2]
+        if crop_rgb.size == 0:
             return None
-        image = Image.fromarray(cropped)
+        image = Image.fromarray(crop_rgb)
         input_tensor = self._resnet_transform(image).unsqueeze(0).to(self._torch_device)
         with torch.no_grad():
             output = self._resnet_model(input_tensor)
@@ -441,23 +443,22 @@ class DetectionContext:
         label = base_class
         confidence_value = float(confidence.item())
 
-        ocr_result = None
-        if (
-            'maximum-speed-limit' in base_class
-            or base_class == OTHER_SIGN_LABEL
-            or label.startswith('speed-limit')
-        ):
-            crop_rgb = frame_rgb[y1:y2, x1:x2]
-            ocr_result = self._speed_limit_ocr.infer(crop_rgb)
-            if ocr_result is not None:
-                label = f"speed-limit-{ocr_result.value}"
-                confidence_value = float((confidence_value + ocr_result.score) / 2.0)
-            else:
+        ocr_result = self._speed_limit_ocr.infer(crop_rgb)
+        if ocr_result is not None and ocr_result.score >= 0.45:
+            label = f"speed-limit-{ocr_result.value}"
+            confidence_value = float((confidence_value + ocr_result.score) / 2.0)
+            base_class_lower = 'regulatory--maximum-speed-limit--g1'
+        else:
+            if 'maximum-speed-limit' in base_class_lower:
                 extracted = self._extract_speed_value(base_class)
                 if extracted is not None:
                     label = f"speed-limit-{extracted}"
-                elif 'maximum-speed-limit' in base_class and not label.startswith('speed-limit-'):
+                else:
                     label = 'speed-limit'
+            elif base_class_lower.startswith('speed-limit'):
+                extracted = self._extract_speed_value(base_class)
+                if extracted is not None:
+                    label = f"speed-limit-{extracted}"
 
         if confidence_value < self.sign_conf_threshold:
             return OTHER_SIGN_LABEL, confidence_value, base_class_lower
@@ -621,7 +622,14 @@ class LiveDetectionCameraManager(base.CameraManager):
     BG_COLOR = (20, 20, 20)
     LABEL_CACHE_MAX = 64
 
-    def __init__(self, parent_actor, hud, detection: DetectionContext, frame_interval: Optional[float] = None):
+    def __init__(
+        self,
+        parent_actor,
+        hud,
+        detection: DetectionContext,
+        frame_interval: Optional[float] = None,
+        show_overlays: bool = True,
+    ):
         super().__init__(parent_actor, hud)
         self._detection = detection
         self._frame_interval = frame_interval if frame_interval and frame_interval > 0 else None
@@ -629,6 +637,7 @@ class LiveDetectionCameraManager(base.CameraManager):
         self._priority_font = pygame.font.Font(pygame.font.get_default_font(), 24)
         self._surface_size: Optional[Tuple[int, int]] = None
         self._label_cache: Dict[Tuple[str, Tuple[int, int, int]], pygame.Surface] = {}
+        self._show_overlays = show_overlays
         self._priority_label: Optional[str] = None
         self._priority_score: float = 0.0
         self._priority_timestamp: float = 0.0
@@ -732,15 +741,16 @@ class LiveDetectionCameraManager(base.CameraManager):
     def _draw_detections(self, surface: pygame.Surface, detections: Sequence[DetectionItem]) -> None:
         width, height = surface.get_width(), surface.get_height()
         detection_list = list(detections)
-        for detection in detection_list:
-            x1, y1, x2, y2 = detection.bbox
-            x1 = max(0, min(width - 1, x1))
-            y1 = max(0, min(height - 1, y1))
-            x2 = max(0, min(width - 1, x2))
-            y2 = max(0, min(height - 1, y2))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            self._draw_label(surface, x1, y1, detection.text, detection.color)
+        if self._show_overlays:
+            for detection in detection_list:
+                x1, y1, x2, y2 = detection.bbox
+                x1 = max(0, min(width - 1, x1))
+                y1 = max(0, min(height - 1, y1))
+                x2 = max(0, min(width - 1, x2))
+                y2 = max(0, min(height - 1, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                self._draw_label(surface, x1, y1, detection.text, detection.color)
         self._update_priority_panel(detection_list)
         self._draw_priority_panel(surface)
 
@@ -1086,7 +1096,14 @@ class LiveDetectionWorld(base.World):
                 previous_manager.sensor.stop()
                 previous_manager.sensor.destroy()
         frame_interval = (1.0 / self._sim_fps) if self._sim_fps else None
-        self.camera_manager = LiveDetectionCameraManager(self.player, self.hud, self._detection, frame_interval)
+        show_overlays = getattr(self._detection, 'show_overlays', True)
+        self.camera_manager = LiveDetectionCameraManager(
+            self.player,
+            self.hud,
+            self._detection,
+            frame_interval,
+            show_overlays=show_overlays,
+        )
         max_transform = max(1, len(self.camera_manager._camera_transforms))
         self.camera_manager.transform_index = transform_index % max_transform
         self.camera_manager.set_sensor(sensor_index, notify=False)
@@ -1221,6 +1238,7 @@ def game_loop(args):
         sign_confidence_threshold=args.sign_conf_threshold,
         skip_labels=args.skip_labels,
         task_focus=args.task_focus,
+        show_overlays=args.show_overlays,
     )
     try:
         client = base.carla.Client(args.host, args.port)
@@ -1270,6 +1288,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
     parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
     parser.add_argument('--task-focus', default='none', choices=['none', 'parking', 'speed', 'navigation', 'safety'], help='task context to boost relevant signs')
+    parser.add_argument('--hide-boxes', action='store_true', help='hide individual detection overlays and show only priority summary')
     parser.add_argument('--sim-fps', default=30.0, type=float, help='target simulation FPS for 1:1 playback (set to 0 to disable throttling)')
     parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
@@ -1286,6 +1305,7 @@ def parse_args() -> argparse.Namespace:
     args.sign_conf_threshold = max(0.0, args.sign_conf_threshold)
     args.task_focus = args.task_focus.lower().strip()
     args.skip_labels = {label.strip().lower() for label in args.skip_labels.split(',') if label.strip()} if args.skip_labels else set()
+    args.show_overlays = not args.hide_boxes
     return args
 
 

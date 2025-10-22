@@ -429,10 +429,10 @@ class DetectionContext:
         if cached is not None:
             return cached.label, cached.confidence, cached.base_class
         x1, y1, x2, y2 = bbox
-        cropped = frame_rgb[y1:y2, x1:x2]
-        if cropped.size == 0:
+        crop_rgb = frame_rgb[y1:y2, x1:x2]
+        if crop_rgb.size == 0:
             return None
-        image = Image.fromarray(cropped)
+        image = Image.fromarray(crop_rgb)
         input_tensor = self._resnet_transform(image).unsqueeze(0).to(self._torch_device)
         with torch.no_grad():
             output = self._resnet_model(input_tensor)
@@ -443,23 +443,22 @@ class DetectionContext:
         label = base_class
         confidence_value = float(confidence.item())
 
-        ocr_result = None
-        if (
-            'maximum-speed-limit' in base_class
-            or base_class == OTHER_SIGN_LABEL
-            or label.startswith('speed-limit')
-        ):
-            crop_rgb = frame_rgb[y1:y2, x1:x2]
-            ocr_result = self._speed_limit_ocr.infer(crop_rgb)
-            if ocr_result is not None:
-                label = f"speed-limit-{ocr_result.value}"
-                confidence_value = float((confidence_value + ocr_result.score) / 2.0)
-            else:
+        ocr_result = self._speed_limit_ocr.infer(crop_rgb)
+        if ocr_result is not None and ocr_result.score >= 0.45:
+            label = f"speed-limit-{ocr_result.value}"
+            confidence_value = float((confidence_value + ocr_result.score) / 2.0)
+            base_class_lower = 'regulatory--maximum-speed-limit--g1'
+        else:
+            if 'maximum-speed-limit' in base_class_lower:
                 extracted = self._extract_speed_value(base_class)
                 if extracted is not None:
                     label = f"speed-limit-{extracted}"
-                elif 'maximum-speed-limit' in base_class and not label.startswith('speed-limit-'):
+                else:
                     label = 'speed-limit'
+            elif base_class_lower.startswith('speed-limit'):
+                extracted = self._extract_speed_value(base_class)
+                if extracted is not None:
+                    label = f"speed-limit-{extracted}"
 
         if confidence_value < self.sign_conf_threshold:
             return OTHER_SIGN_LABEL, confidence_value, base_class_lower
