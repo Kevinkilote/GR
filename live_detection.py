@@ -1280,19 +1280,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--weights', default='best.pt', help='path to YOLOv11 weights (default: best.pt)')
     parser.add_argument('--resnet', default='best_traffic_sign_classifier_advanced.pth', help='path to traffic sign ResNet weights (default: best_traffic_sign_classifier_advanced.pth; use "none" to disable)')
     parser.add_argument('--sign-labels', default=None, help='comma-separated YOLO class names to refine with ResNet (default uses known traffic sign labels)')
-    parser.add_argument('--conf', default=0.25, type=float, help='YOLO confidence threshold (default: 0.25)')
+    parser.add_argument('--conf', default=0.4, type=float, help='YOLO confidence threshold (default: 0.25)')
     parser.add_argument('--iou', default=0.45, type=float, help='YOLO IoU threshold (default: 0.45)')
     parser.add_argument('--device', default='cuda:0', help='Torch device for YOLO (default: cuda:0)')
     parser.add_argument('--detection-interval', default=0.05, type=float, help='minimum seconds between YOLO inferences (default: 0.05)')
     parser.add_argument('--display-ttl', default=0.3, type=float, help='seconds to keep last detections on screen (default: 0.3)')
     parser.add_argument('--sign-cache-ttl', default=0.75, type=float, help='seconds to reuse cached ResNet classifications (default: 0.75)')
-    parser.add_argument('--sign-conf-threshold', default=0.6, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
+    parser.add_argument('--sign-conf-threshold', default=0.65, type=float, help='minimum ResNet confidence before accepting a sign class (default: 0.6)')
     parser.add_argument('--skip-labels', default='', help='comma-separated YOLO class names to ignore (e.g., "car,truck")')
     parser.add_argument('--task-focus', default='none', choices=['none', 'parking', 'speed', 'navigation', 'safety'], help='task context to boost relevant signs')
     parser.add_argument('--hide-boxes', action='store_true', help='hide individual detection overlays and show only priority summary')
     parser.add_argument('--sim-fps', default=30.0, type=float, help='target simulation FPS for 1:1 playback (set to 0 to disable throttling)')
     parser.add_argument('--detect-button', default=None, type=int, help='joystick button index to toggle detection (omit to use keyboard only; set -1 to disable)')
     parser.add_argument('--debug', action='store_true', help='print debug information')
+    parser.add_argument('--min-priority-frames', default=4, type=int, help='minimum frames a sign must persist before it can drive priority text (default: 3)')
+
     args = parser.parse_args()
     args.width, args.height = [int(x) for x in args.res.split('x')]
     if args.detect_button is not None and args.detect_button < 0:
@@ -1324,4 +1326,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    parser.add_argument('--min-priority-frames', default=3, type=int, help='minimum frames a sign must persist before it can drive priority text (default: 3)')
