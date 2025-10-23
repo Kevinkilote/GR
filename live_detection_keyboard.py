@@ -631,8 +631,9 @@ class LiveDetectionCameraManager(base.CameraManager):
         detection: DetectionContext,
         frame_interval: Optional[float] = None,
         show_overlays: bool = True,
+        gamma_correction: float = 2.2,
     ):
-        super().__init__(parent_actor, hud)
+        super().__init__(parent_actor, hud, gamma_correction)
         self._detection = detection
         self._frame_interval = frame_interval if frame_interval and frame_interval > 0 else None
         self._label_font = pygame.font.Font(pygame.font.get_default_font(), 18)
@@ -1115,12 +1116,14 @@ class LiveDetectionWorld(base.World):
                 previous_manager.sensor.destroy()
         frame_interval = (1.0 / self._sim_fps) if self._sim_fps else None
         show_overlays = getattr(self._detection, 'show_overlays', True)
+        gamma = getattr(previous_manager, '_gamma', 2.2)
         self.camera_manager = LiveDetectionCameraManager(
             self.player,
             self.hud,
             self._detection,
             frame_interval,
             show_overlays=show_overlays,
+            gamma_correction=gamma,
         )
         max_transform = max(1, len(self.camera_manager._camera_transforms))
         self.camera_manager.transform_index = transform_index % max_transform
